@@ -76,6 +76,13 @@ _wrap_pkcs1_as_pkcs8 = _worker._wrap_pkcs1_as_pkcs8
 _der_len = _worker._der_len
 _b64url = _worker._b64url
 _is_human = _worker._is_human
+_files_changed_color = _worker._files_changed_color
+apply_files_changed_label = _worker.apply_files_changed_label
+apply_migration_label = _worker.apply_migration_label
+check_linked_issue = _worker.check_linked_issue
+check_pr_conflicts = _worker.check_pr_conflicts
+enforce_pr_limit = _worker.enforce_pr_limit
+handle_pull_request_synchronize = _worker.handle_pull_request_synchronize
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +532,13 @@ class TestHandlePullRequestOpened(unittest.TestCase):
 
     def _run_opened(self, payload, comments):
         async def _inner():
-            with patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))):
+            with (
+                patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))),
+                patch.object(_worker, "enforce_pr_limit", new=AsyncMock(return_value=False)),
+                patch.object(_worker, "apply_files_changed_label", new=AsyncMock()),
+                patch.object(_worker, "apply_migration_label", new=AsyncMock()),
+                patch.object(_worker, "check_linked_issue", new=AsyncMock()),
+            ):
                 await _worker.handle_pull_request_opened(payload, "tok")
         _run(_inner())
 
@@ -542,6 +555,344 @@ class TestHandlePullRequestOpened(unittest.TestCase):
         comments = []
         self._run_opened(payload, comments)
         self.assertEqual(comments, [])
+
+    def test_skips_when_pr_limit_exceeded(self):
+        payload = _make_pr_payload()
+        comments = []
+        async def _inner():
+            with (
+                patch.object(_worker, "create_comment", new=AsyncMock(side_effect=lambda o, r, n, b, t: comments.append(b))),
+                patch.object(_worker, "enforce_pr_limit", new=AsyncMock(return_value=True)),
+                patch.object(_worker, "apply_files_changed_label", new=AsyncMock()) as mock_files,
+                patch.object(_worker, "apply_migration_label", new=AsyncMock()),
+                patch.object(_worker, "check_linked_issue", new=AsyncMock()),
+            ):
+                await _worker.handle_pull_request_opened(payload, "tok")
+                # When limit is exceeded, no welcome comment or labels should be applied
+                mock_files.assert_not_called()
+        _run(_inner())
+        self.assertEqual(comments, [])
+
+
+# ---------------------------------------------------------------------------
+# PR Automation — files-changed color helper
+# ---------------------------------------------------------------------------
+
+
+class TestFilesChangedColor(unittest.TestCase):
+    def test_zero_files(self):
+        self.assertEqual(_files_changed_color(0), "cccccc")
+
+    def test_one_file(self):
+        self.assertEqual(_files_changed_color(1), "0e8a16")
+
+    def test_five_files(self):
+        self.assertEqual(_files_changed_color(5), "fbca04")
+
+    def test_six_files(self):
+        self.assertEqual(_files_changed_color(6), "ff9800")
+
+    def test_ten_files(self):
+        self.assertEqual(_files_changed_color(10), "ff9800")
+
+    def test_eleven_files(self):
+        self.assertEqual(_files_changed_color(11), "e74c3c")
+
+    def test_hundred_files(self):
+        self.assertEqual(_files_changed_color(100), "e74c3c")
+
+
+# ---------------------------------------------------------------------------
+# PR Automation — apply_files_changed_label
+# ---------------------------------------------------------------------------
+
+
+class _MockResponse:
+    """Minimal mock for the fetch/github_api response object."""
+    def __init__(self, status, data=None):
+        self.status = status
+        self._data = data or []
+
+    async def text(self):
+        return json.dumps(self._data)
+
+
+class TestApplyFilesChangedLabel(unittest.TestCase):
+    def _run(self, file_count, api_calls):
+        files = [{"filename": f"file{i}.py"} for i in range(file_count)]
+        label_resp = _MockResponse(404)
+
+        async def mock_api(method, path, token, body=None):
+            api_calls.append((method, path, body))
+            if "pulls/" in path and "/files" in path:
+                return _MockResponse(200, files)
+            if "/labels/" in path and method == "GET":
+                return label_resp
+            if "/labels" in path and method in ("GET", "POST", "PATCH", "DELETE"):
+                return _MockResponse(200, [])
+            return _MockResponse(200)
+
+        async def _inner():
+            with (
+                patch.object(_worker, "github_api", new=mock_api),
+            ):
+                await _worker.apply_files_changed_label(
+                    "owner", "repo", {"number": 1}, "tok"
+                )
+        asyncio.run(_inner())
+
+    def test_labels_with_correct_count(self):
+        calls = []
+        self._run(3, calls)
+        # Should include a POST to create the label on the issue
+        label_posts = [c for c in calls if c[0] == "POST" and "/issues/1/labels" in c[1]]
+        self.assertEqual(len(label_posts), 1)
+        self.assertIn("files-changed: 3", str(label_posts[0][2]))
+
+    def test_zero_files(self):
+        calls = []
+        self._run(0, calls)
+        label_posts = [c for c in calls if c[0] == "POST" and "/issues/1/labels" in c[1]]
+        self.assertEqual(len(label_posts), 1)
+        self.assertIn("files-changed: 0", str(label_posts[0][2]))
+
+
+# ---------------------------------------------------------------------------
+# PR Automation — apply_migration_label
+# ---------------------------------------------------------------------------
+
+
+class TestApplyMigrationLabel(unittest.TestCase):
+    def _run(self, filenames, api_calls):
+        files = [{"filename": f} for f in filenames]
+
+        async def mock_api(method, path, token, body=None):
+            api_calls.append((method, path, body))
+            if "pulls/" in path and "/files" in path:
+                return _MockResponse(200, files)
+            if "/labels/" in path and method == "GET":
+                return _MockResponse(404)
+            return _MockResponse(200)
+
+        async def _inner():
+            with patch.object(_worker, "github_api", new=mock_api):
+                await _worker.apply_migration_label(
+                    "owner", "repo", {"number": 1}, "tok"
+                )
+        asyncio.run(_inner())
+
+    def test_adds_label_for_migration_file(self):
+        calls = []
+        self._run(["app/migrations/0001_initial.py", "app/views.py"], calls)
+        label_posts = [c for c in calls if c[0] == "POST" and "/issues/1/labels" in c[1]]
+        self.assertEqual(len(label_posts), 1)
+        self.assertIn("migration", str(label_posts[0][2]))
+
+    def test_no_label_without_migration_files(self):
+        calls = []
+        self._run(["app/views.py", "app/models.py"], calls)
+        label_posts = [c for c in calls if c[0] == "POST" and "/issues/1/labels" in c[1]]
+        self.assertEqual(len(label_posts), 0)
+
+
+# ---------------------------------------------------------------------------
+# PR Automation — check_linked_issue
+# ---------------------------------------------------------------------------
+
+
+class TestCheckLinkedIssue(unittest.TestCase):
+    def _run(self, pr_body, comments, api_calls):
+        async def mock_api(method, path, token, body=None):
+            api_calls.append((method, path, body))
+            if "/labels/" in path and method == "GET":
+                return _MockResponse(404)
+            if "/labels" in path and method == "GET":
+                return _MockResponse(200, [])
+            return _MockResponse(200)
+
+        async def _inner():
+            with (
+                patch.object(_worker, "github_api", new=mock_api),
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments.append(b)
+                )),
+            ):
+                await _worker.check_linked_issue(
+                    "owner", "repo", {"number": 1, "body": pr_body}, "tok"
+                )
+        asyncio.run(_inner())
+
+    def test_adds_label_when_issue_linked(self):
+        comments, calls = [], []
+        self._run("Closes #123", comments, calls)
+        label_posts = [c for c in calls if c[0] == "POST" and "/issues/1/labels" in c[1]]
+        self.assertTrue(any("linked-issue" in str(p) for p in label_posts))
+        self.assertEqual(comments, [])  # No warning comment
+
+    def test_warns_when_no_issue_linked(self):
+        comments, calls = [], []
+        self._run("Some PR body without issue link", comments, calls)
+        self.assertEqual(len(comments), 1)
+        self.assertIn("No linked issue detected", comments[0])
+
+    def test_fixes_keyword_variation(self):
+        comments, calls = [], []
+        self._run("Fixes #456", comments, calls)
+        self.assertEqual(comments, [])  # No warning
+
+    def test_resolves_keyword_variation(self):
+        comments, calls = [], []
+        self._run("Resolves #789", comments, calls)
+        self.assertEqual(comments, [])
+
+    def test_empty_body(self):
+        comments, calls = [], []
+        self._run("", comments, calls)
+        self.assertEqual(len(comments), 1)
+        self.assertIn("No linked issue detected", comments[0])
+
+    def test_none_body(self):
+        comments, calls = [], []
+        self._run(None, comments, calls)
+        self.assertEqual(len(comments), 1)
+
+
+# ---------------------------------------------------------------------------
+# PR Automation — check_pr_conflicts
+# ---------------------------------------------------------------------------
+
+
+class TestCheckPRConflicts(unittest.TestCase):
+    def _run(self, mergeable, comments, api_calls):
+        async def mock_api(method, path, token, body=None):
+            api_calls.append((method, path, body))
+            if "/labels/" in path and method == "GET":
+                return _MockResponse(404)
+            if "/labels" in path and method == "GET":
+                return _MockResponse(200, [])
+            return _MockResponse(200)
+
+        async def _inner():
+            with (
+                patch.object(_worker, "github_api", new=mock_api),
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments.append(b)
+                )),
+            ):
+                await _worker.check_pr_conflicts(
+                    "owner", "repo", {"number": 1, "mergeable": mergeable}, "tok"
+                )
+        asyncio.run(_inner())
+
+    def test_warns_on_conflict(self):
+        comments, calls = [], []
+        self._run(False, comments, calls)
+        self.assertEqual(len(comments), 1)
+        self.assertIn("Merge conflicts detected", comments[0])
+        label_posts = [c for c in calls if c[0] == "POST" and "/issues/1/labels" in c[1]]
+        self.assertTrue(any("has-conflicts" in str(p) for p in label_posts))
+
+    def test_no_warning_when_mergeable(self):
+        comments, calls = [], []
+        self._run(True, comments, calls)
+        self.assertEqual(comments, [])
+
+    def test_no_warning_when_unknown(self):
+        comments, calls = [], []
+        self._run(None, comments, calls)
+        self.assertEqual(comments, [])
+
+
+# ---------------------------------------------------------------------------
+# PR Automation — enforce_pr_limit
+# ---------------------------------------------------------------------------
+
+
+class TestEnforcePRLimit(unittest.TestCase):
+    def _run(self, open_pr_count):
+        open_prs = [
+            {"user": {"login": "alice"}, "number": i}
+            for i in range(open_pr_count)
+        ]
+        comments = []
+        closed = False
+
+        async def mock_api(method, path, token, body=None):
+            nonlocal closed
+            if "pulls?state=open" in path:
+                return _MockResponse(200, open_prs)
+            if method == "PATCH" and "/pulls/" in path:
+                closed = True
+            return _MockResponse(200)
+
+        async def _inner():
+            nonlocal closed
+            with (
+                patch.object(_worker, "github_api", new=mock_api),
+                patch.object(_worker, "create_comment", new=AsyncMock(
+                    side_effect=lambda o, r, n, b, t: comments.append(b)
+                )),
+            ):
+                result = await _worker.enforce_pr_limit(
+                    "owner", "repo", {"number": 999}, "alice", "tok"
+                )
+                return result
+        return asyncio.run(_inner()), comments, closed
+
+    def test_allows_under_limit(self):
+        result, comments, closed = self._run(10)
+        self.assertFalse(result)
+        self.assertEqual(comments, [])
+        self.assertFalse(closed)
+
+    def test_allows_at_limit(self):
+        result, comments, closed = self._run(50)
+        self.assertFalse(result)
+        self.assertEqual(comments, [])
+
+    def test_closes_over_limit(self):
+        result, comments, closed = self._run(51)
+        self.assertTrue(result)
+        self.assertEqual(len(comments), 1)
+        self.assertIn("exceeds the limit", comments[0])
+        self.assertTrue(closed)
+
+
+# ---------------------------------------------------------------------------
+# PR Automation — handle_pull_request_synchronize
+# ---------------------------------------------------------------------------
+
+
+class TestHandlePullRequestSynchronize(unittest.TestCase):
+    def test_runs_automation_labels(self):
+        payload = _make_pr_payload()
+        calls = []
+
+        async def _inner():
+            with (
+                patch.object(_worker, "apply_files_changed_label", new=AsyncMock(side_effect=lambda *a: calls.append("files"))),
+                patch.object(_worker, "apply_migration_label", new=AsyncMock(side_effect=lambda *a: calls.append("migration"))),
+                patch.object(_worker, "check_linked_issue", new=AsyncMock(side_effect=lambda *a: calls.append("linked"))),
+                patch.object(_worker, "check_pr_conflicts", new=AsyncMock(side_effect=lambda *a: calls.append("conflicts"))),
+            ):
+                await _worker.handle_pull_request_synchronize(payload, "tok")
+        _run(_inner())
+        self.assertEqual(calls, ["files", "migration", "linked", "conflicts"])
+
+    def test_ignores_bot(self):
+        payload = _make_pr_payload(sender={"login": "bot", "type": "Bot"})
+        calls = []
+
+        async def _inner():
+            with (
+                patch.object(_worker, "apply_files_changed_label", new=AsyncMock(side_effect=lambda *a: calls.append("files"))),
+                patch.object(_worker, "apply_migration_label", new=AsyncMock()),
+                patch.object(_worker, "check_linked_issue", new=AsyncMock()),
+                patch.object(_worker, "check_pr_conflicts", new=AsyncMock()),
+            ):
+                await _worker.handle_pull_request_synchronize(payload, "tok")
+        _run(_inner())
+        self.assertEqual(calls, [])
 
 
 class TestHandlePullRequestClosed(unittest.TestCase):

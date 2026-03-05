@@ -22,6 +22,7 @@ import hashlib
 import hmac as _hmac
 import json
 import time
+import re
 from urllib.parse import urlparse
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
@@ -35,6 +36,18 @@ UNASSIGN_COMMAND = "/unassign"
 MAX_ASSIGNEES = 3
 ASSIGNMENT_DURATION_HOURS = 24
 BUG_LABELS = {"bug", "vulnerability", "security"}
+
+# PR automation constants
+MAX_OPEN_PRS_PER_AUTHOR = 50
+FILES_CHANGED_COLORS = {
+    0: "cccccc",   # gray
+    1: "0e8a16",   # green
+    2: "fbca04",   # yellow
+    6: "ff9800",   # orange
+    11: "e74c3c",  # red
+}
+ISSUE_LINK_PATTERN = r"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#\d+"
+MIGRATION_PATH_PATTERN = r"migrations/\d{4}_"
 
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
@@ -417,6 +430,194 @@ async def handle_issue_labeled(
         )
 
 
+# ---------------------------------------------------------------------------
+# PR automation helpers
+# ---------------------------------------------------------------------------
+
+
+def _files_changed_color(count: int) -> str:
+    """Return a hex colour based on the number of changed files."""
+    colour = "cccccc"
+    for threshold in sorted(FILES_CHANGED_COLORS):
+        if count >= threshold:
+            colour = FILES_CHANGED_COLORS[threshold]
+    return colour
+
+
+async def _ensure_label(
+    owner: str, repo: str, name: str, color: str, token: str
+) -> None:
+    """Create a label if it does not already exist, or update its colour."""
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/labels/{name.replace(' ', '%20')}",
+        token,
+    )
+    if resp.status == 404:
+        await github_api(
+            "POST",
+            f"/repos/{owner}/{repo}/labels",
+            token,
+            {"name": name, "color": color},
+        )
+    elif resp.status == 200:
+        data = json.loads(await resp.text())
+        if data.get("color") != color:
+            await github_api(
+                "PATCH",
+                f"/repos/{owner}/{repo}/labels/{name.replace(' ', '%20')}",
+                token,
+                {"color": color},
+            )
+
+
+async def _set_label(
+    owner: str, repo: str, number: int, name: str, color: str, token: str
+) -> None:
+    """Ensure a label exists and add it to a PR/issue."""
+    await _ensure_label(owner, repo, name, color, token)
+    await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/issues/{number}/labels",
+        token,
+        {"labels": [name]},
+    )
+
+
+async def _remove_labels_with_prefix(
+    owner: str, repo: str, number: int, prefix: str, token: str
+) -> None:
+    """Remove all labels whose name starts with *prefix* from a PR/issue."""
+    resp = await github_api(
+        "GET", f"/repos/{owner}/{repo}/issues/{number}/labels", token
+    )
+    if resp.status != 200:
+        return
+    labels = json.loads(await resp.text())
+    for lb in labels:
+        if lb["name"].startswith(prefix):
+            await github_api(
+                "DELETE",
+                f"/repos/{owner}/{repo}/issues/{number}/labels/{lb['name'].replace(' ', '%20')}",
+                token,
+            )
+
+
+# ---------------------------------------------------------------------------
+# PR automation handlers
+# ---------------------------------------------------------------------------
+
+
+async def apply_files_changed_label(
+    owner: str, repo: str, pr: dict, token: str
+) -> None:
+    """Add a colour-coded 'files-changed: N' label to a pull request."""
+    resp = await github_api(
+        "GET", f"/repos/{owner}/{repo}/pulls/{pr['number']}/files", token
+    )
+    if resp.status != 200:
+        return
+    files = json.loads(await resp.text())
+    count = len(files)
+    label_name = f"files-changed: {count}"
+    color = _files_changed_color(count)
+
+    # Remove any existing files-changed label
+    await _remove_labels_with_prefix(owner, repo, pr["number"], "files-changed:", token)
+    await _set_label(owner, repo, pr["number"], label_name, color, token)
+
+
+async def apply_migration_label(
+    owner: str, repo: str, pr: dict, token: str
+) -> None:
+    """Add a 'migration' label if the PR touches Django migration files."""
+    resp = await github_api(
+        "GET", f"/repos/{owner}/{repo}/pulls/{pr['number']}/files", token
+    )
+    if resp.status != 200:
+        return
+    files = json.loads(await resp.text())
+    has_migration = any(
+        re.search(MIGRATION_PATH_PATTERN, f.get("filename", ""))
+        for f in files
+    )
+    if has_migration:
+        await _set_label(owner, repo, pr["number"], "migration", "5319e7", token)
+
+
+async def check_linked_issue(
+    owner: str, repo: str, pr: dict, token: str
+) -> None:
+    """Warn if the PR body does not reference an issue (e.g. 'Closes #123')."""
+    body = pr.get("body") or ""
+    if re.search(ISSUE_LINK_PATTERN, body):
+        await _set_label(owner, repo, pr["number"], "linked-issue", "0e8a16", token)
+    else:
+        await _remove_labels_with_prefix(owner, repo, pr["number"], "linked-issue", token)
+        await create_comment(
+            owner, repo, pr["number"],
+            "⚠️ **No linked issue detected.** Please reference an issue in your PR "
+            "description using a keyword like `Closes #123` or `Fixes #456`.\n\n"
+            "This helps us track which issues are resolved by this PR.",
+            token,
+        )
+
+
+async def check_pr_conflicts(
+    owner: str, repo: str, pr: dict, token: str
+) -> None:
+    """Post a warning comment when a PR has merge conflicts."""
+    mergeable = pr.get("mergeable")
+    if mergeable is False:
+        await _set_label(owner, repo, pr["number"], "has-conflicts", "e74c3c", token)
+        await create_comment(
+            owner, repo, pr["number"],
+            "⚠️ **Merge conflicts detected.** Please resolve the conflicts "
+            "in this PR so that it can be reviewed and merged.\n\n"
+            "You can resolve conflicts by rebasing on the latest `main` branch:\n"
+            "```bash\ngit fetch origin\ngit rebase origin/main\n```",
+            token,
+        )
+    else:
+        await _remove_labels_with_prefix(owner, repo, pr["number"], "has-conflicts", token)
+
+
+async def enforce_pr_limit(
+    owner: str, repo: str, pr: dict, sender: str, token: str
+) -> bool:
+    """Close the PR with a message if the author exceeds the open-PR limit.
+
+    Returns True if the PR was closed.
+    """
+    resp = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/pulls?state=open&per_page=100",
+        token,
+    )
+    if resp.status != 200:
+        return False
+    open_prs = json.loads(await resp.text())
+    author_prs = [p for p in open_prs if (p.get("user") or {}).get("login") == sender]
+    if len(author_prs) > MAX_OPEN_PRS_PER_AUTHOR:
+        await create_comment(
+            owner, repo, pr["number"],
+            f"⚠️ @{sender} You currently have **{len(author_prs)}** open pull requests "
+            f"in this repository, which exceeds the limit of "
+            f"**{MAX_OPEN_PRS_PER_AUTHOR}**.\n\n"
+            "This PR has been automatically closed. Please merge or close some of "
+            "your existing PRs before opening new ones.",
+            token,
+        )
+        await github_api(
+            "PATCH",
+            f"/repos/{owner}/{repo}/pulls/{pr['number']}",
+            token,
+            {"state": "closed"},
+        )
+        return True
+    return False
+
+
 async def handle_pull_request_opened(payload: dict, token: str) -> None:
     pr = payload["pull_request"]
     sender = payload["sender"]
@@ -424,6 +625,12 @@ async def handle_pull_request_opened(payload: dict, token: str) -> None:
         return
     owner = payload["repository"]["owner"]["login"]
     repo = payload["repository"]["name"]
+
+    # Enforce PR-per-author limit first
+    closed = await enforce_pr_limit(owner, repo, pr, sender["login"], token)
+    if closed:
+        return
+
     body = (
         f"👋 Thanks for opening this pull request, @{sender['login']}!\n\n"
         "**Before your PR is reviewed, please ensure:**\n"
@@ -436,6 +643,26 @@ async def handle_pull_request_opened(payload: dict, token: str) -> None:
         "🚀 Keep up the great work! — [OWASP BLT](https://owaspblt.org)"
     )
     await create_comment(owner, repo, pr["number"], body, token)
+
+    # Apply automation labels
+    await apply_files_changed_label(owner, repo, pr, token)
+    await apply_migration_label(owner, repo, pr, token)
+    await check_linked_issue(owner, repo, pr, token)
+
+
+async def handle_pull_request_synchronize(payload: dict, token: str) -> None:
+    """Re-run automation labels when new commits are pushed to a PR."""
+    pr = payload["pull_request"]
+    sender = payload["sender"]
+    if not _is_human(sender):
+        return
+    owner = payload["repository"]["owner"]["login"]
+    repo = payload["repository"]["name"]
+
+    await apply_files_changed_label(owner, repo, pr, token)
+    await apply_migration_label(owner, repo, pr, token)
+    await check_linked_issue(owner, repo, pr, token)
+    await check_pr_conflicts(owner, repo, pr, token)
 
 
 async def handle_pull_request_closed(payload: dict, token: str) -> None:
@@ -500,8 +727,10 @@ async def handle_webhook(request, env) -> Response:
             elif action == "labeled":
                 await handle_issue_labeled(payload, token, blt_api_url)
         elif event == "pull_request":
-            if action == "opened":
+            if action in ("opened", "reopened"):
                 await handle_pull_request_opened(payload, token)
+            elif action == "synchronize":
+                await handle_pull_request_synchronize(payload, token)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token)
     except Exception as exc:
