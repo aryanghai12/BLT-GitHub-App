@@ -22,6 +22,7 @@ import calendar
 import hashlib
 import hmac as _hmac
 import json
+import re
 import time
 from typing import Optional, Tuple
 from urllib.parse import quote, urlparse
@@ -39,6 +40,12 @@ LEADERBOARD_COMMAND = "/leaderboard"
 MAX_ASSIGNEES = 1
 ASSIGNMENT_DURATION_HOURS = 8
 BUG_LABELS = {"bug", "vulnerability", "security"}
+
+# JS/TS file extensions subject to the console statement check
+_CONSOLE_JS_EXTENSIONS = (".js", ".ts", ".jsx", ".tsx")
+
+# Regex pattern from check-console-log.yml — matches any console.* call
+_CONSOLE_PATTERN = re.compile(r"console\.[a-zA-Z]+\s*\(")
 
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
@@ -1301,7 +1308,6 @@ async def _calculate_leaderboard_stats(owner: str, repos: list, token: str, wind
 def _parse_github_timestamp(ts_str: str) -> int:
     """Parse GitHub ISO 8601 timestamp to Unix timestamp."""
     # GitHub timestamps are like: 2024-03-05T12:34:56Z
-    import re
     match = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z", ts_str)
     if match:
         year, month, day, hour, minute, second = map(int, match.groups())
@@ -1851,7 +1857,12 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
 
     # Track open PR counter in D1.
     await _track_pr_opened_in_d1(payload, env)
-    
+
+    # Run console statement check via GitHub Checks API.
+    head_sha = pr.get("head", {}).get("sha", "")
+    if head_sha:
+        await run_console_check(owner, repo, pr_number, head_sha, token)
+
     # Post welcome message
     body = (
         f"👋 Thanks for opening this pull request, @{author_login}!\n\n"
@@ -1865,7 +1876,7 @@ async def handle_pull_request_opened(payload: dict, token: str, env=None) -> Non
         "🚀 Keep up the great work! — [OWASP BLT](https://owaspblt.org)"
     )
     await create_comment(owner, repo, pr_number, body, token)
-    
+
     # Post leaderboard
     if env is None:
         await _post_or_update_leaderboard(owner, repo, pr_number, author_login, token)
@@ -2238,6 +2249,148 @@ async def handle_pull_request_for_review(payload: dict, token: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GitHub Checks API helpers
+# ---------------------------------------------------------------------------
+
+
+async def create_check_run(owner: str, repo: str, name: str, head_sha: str, token: str) -> int:
+    """Create a GitHub check run in 'in_progress' state. Returns check_run_id or 0 on failure."""
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    resp = await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/check-runs",
+        token,
+        {"name": name, "head_sha": head_sha, "status": "in_progress", "started_at": now},
+    )
+    if resp.status not in (200, 201):
+        console.error(f"[Checks] Failed to create check run '{name}': status={resp.status}")
+        return 0
+    return json.loads(await resp.text()).get("id", 0)
+
+
+async def update_check_run(
+    owner: str,
+    repo: str,
+    check_run_id: int,
+    conclusion: str,
+    title: str,
+    summary: str,
+    annotations: list,
+    token: str,
+) -> None:
+    """Complete a GitHub check run. GitHub caps annotations at 50 per request."""
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    await github_api(
+        "PATCH",
+        f"/repos/{owner}/{repo}/check-runs/{check_run_id}",
+        token,
+        {
+            "status": "completed",
+            "conclusion": conclusion,
+            "completed_at": now,
+            "output": {"title": title, "summary": summary, "annotations": annotations[:50]},
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Console statement check
+# ---------------------------------------------------------------------------
+
+
+def _scan_console_statements(content: str, filename: str) -> list:
+    """Return GitHub Check annotation dicts for each console.* call found."""
+    annotations = []
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("//") or stripped.startswith("*") or stripped.startswith("/*"):
+            continue
+        if _CONSOLE_PATTERN.search(stripped):
+            annotations.append({
+                "path": filename,
+                "start_line": line_no,
+                "end_line": line_no,
+                "annotation_level": "failure",
+                "title": "Console statement detected",
+                "message": f"Remove `console.*` before merging: `{stripped[:120]}`",
+            })
+    return annotations
+
+
+async def run_console_check(owner: str, repo: str, pr_number: int, head_sha: str, token: str) -> None:
+    """Scan changed JS/TS files in a PR for console.* calls and report via Checks API."""
+    check_run_id = await create_check_run(owner, repo, "Console Statement Check", head_sha, token)
+    if not check_run_id:
+        return
+
+    files_resp = await github_api(
+        "GET", f"/repos/{owner}/{repo}/pulls/{pr_number}/files?per_page=100", token
+    )
+    if files_resp.status != 200:
+        await update_check_run(
+            owner, repo, check_run_id, "neutral",
+            "Console Statement Check — skipped",
+            "Could not fetch the list of files changed in this PR.", [], token,
+        )
+        return
+
+    js_files = [
+        f for f in json.loads(await files_resp.text())
+        if any(f.get("filename", "").endswith(ext) for ext in _CONSOLE_JS_EXTENSIONS)
+        and f.get("status") != "removed"
+    ][:20]  # cap to stay within Cloudflare subrequest budget
+
+    annotations = []
+    for file_info in js_files:
+        filename = file_info.get("filename", "")
+        content_resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/contents/{_url_quote(filename, safe='/')}?ref={head_sha}",
+            token,
+        )
+        if content_resp.status != 200:
+            continue
+        data = json.loads(await content_resp.text())
+        raw_b64 = data.get("content", "")
+        if not raw_b64 or data.get("encoding") != "base64":
+            continue
+        try:
+            content = base64.b64decode(raw_b64.replace("\n", "")).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        annotations.extend(_scan_console_statements(content, filename))
+
+    count = len(annotations)
+    if annotations:
+        conclusion = "failure"
+        title = f"Console Statement Check — {count} issue{'s' if count != 1 else ''} found"
+        summary = f"Found **{count}** `console.*` call{'s' if count != 1 else ''} in this PR. Remove all `console.*` statements before merging."
+    else:
+        conclusion = "success"
+        title = "Console Statement Check — passed"
+        summary = "No `console.*` statements found in changed JS/TS files."
+
+    await update_check_run(owner, repo, check_run_id, conclusion, title, summary, annotations, token)
+
+
+async def handle_pull_request_synchronize(payload: dict, token: str, env=None) -> None:
+    """Re-run CI checks when new commits are pushed to an open PR."""
+    pr = payload.get("pull_request") or {}
+    sender = payload.get("sender") or {}
+    if not _is_human(sender) or _is_bot(sender):
+        return
+
+    owner = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    repo = (payload.get("repository") or {}).get("name", "")
+    pr_number = pr.get("number")
+    head_sha = (pr.get("head") or {}).get("sha", "")
+    if not (owner and repo and pr_number and head_sha):
+        return
+
+    await run_console_check(owner, repo, pr_number, head_sha, token)
+
+
+# ---------------------------------------------------------------------------
 # Webhook dispatcher
 # ---------------------------------------------------------------------------
 
@@ -2317,7 +2470,10 @@ async def handle_webhook(request, env) -> Response:
             if action == "opened":
                 await handle_pull_request_opened(payload, token, env)
                 await handle_pull_request_for_review(payload, token)
-            elif action == "synchronize" or action == "reopened":
+            elif action == "synchronize":
+                await handle_pull_request_synchronize(payload, token, env)
+                await handle_pull_request_for_review(payload, token)
+            elif action == "reopened":
                 await handle_pull_request_for_review(payload, token)
             elif action == "closed":
                 await handle_pull_request_closed(payload, token, env)
