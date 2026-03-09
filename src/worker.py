@@ -57,7 +57,7 @@ MIGRATION_PATH_PATTERN = r"migrations/\d{4}_"
 FEATURE_DEFAULTS = {
     "FEATURE_PR_SIZE_LABEL": True,
     "FEATURE_MIGRATION_LABEL": True,
-    "FEATURE_ISSUE_LINK_CHECK": False,
+    "FEATURE_ISSUE_LINK_CHECK": True,
     "FEATURE_CONFLICT_CHECK": True,
     "FEATURE_PR_LIMIT": True,
     "FEATURE_WELCOME_COMMENT": True,
@@ -1961,6 +1961,17 @@ async def _remove_labels_with_prefix(
             )
 
 
+async def _remove_label(
+    owner: str, repo: str, number: int, label: str, token: str
+) -> None:
+    """Remove exactly one label (exact name match) from a PR/issue."""
+    await github_api(
+        "DELETE",
+        f"/repos/{owner}/{repo}/issues/{number}/labels/{label.replace(' ', '%20')}",
+        token,
+    )
+
+
 # ---------------------------------------------------------------------------
 # PR automation handlers
 # ---------------------------------------------------------------------------
@@ -2020,7 +2031,7 @@ async def apply_migration_label(
     if has_migration:
         await _set_label(owner, repo, pr["number"], "migration", "5319e7", token)
     else:
-        await _remove_labels_with_prefix(owner, repo, pr["number"], "migration", token)
+        await _remove_label(owner, repo, pr["number"], "migration", token)
 
 
 async def _has_bot_comment(

@@ -992,7 +992,7 @@ class TestHandlePullRequestSynchronize(unittest.TestCase):
             ):
                 await _worker.handle_pull_request_synchronize(payload, "tok")
         _run(_inner())
-        self.assertEqual(calls, ["files", "migration", "conflicts"])
+        self.assertEqual(calls, ["files", "migration", "linked", "conflicts"])
 
     def test_ignores_bot(self):
         payload = _make_pr_payload(sender={"login": "bot", "type": "Bot"})
@@ -1601,11 +1601,7 @@ class TestGetFeatureConfig(unittest.TestCase):
         env = self._make_env()
         config = get_feature_config(env)
         for key in FEATURE_DEFAULTS:
-            # FEATURE_ISSUE_LINK_CHECK is intentionally off by default
-            if key == "FEATURE_ISSUE_LINK_CHECK":
-                self.assertFalse(config[key], f"{key} should default to False")
-            else:
-                self.assertTrue(config[key], f"{key} should default to True")
+            self.assertTrue(config[key], f"{key} should default to True")
 
     def test_disable_single_feature(self):
         env = self._make_env(FEATURE_PR_SIZE_LABEL="false")
@@ -1843,7 +1839,7 @@ class TestFeatureTogglePRSynchronize(unittest.TestCase):
     def test_all_enabled(self):
         calls = []
         self._run_sync(dict(FEATURE_DEFAULTS), calls)
-        self.assertEqual(calls, ["files", "migration", "conflicts"])
+        self.assertEqual(calls, ["files", "migration", "linked", "conflicts"])
 
     def test_conflict_check_disabled(self):
         features = dict(FEATURE_DEFAULTS, FEATURE_CONFLICT_CHECK=False)
