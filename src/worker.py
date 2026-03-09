@@ -49,10 +49,6 @@ _CONSOLE_PATTERN = re.compile(r"console\.[a-zA-Z]+\s*\(")
 _STRIP_STRINGS_RE = re.compile(r'"[^"]*"|\'[^\']*\'|`[^`]*`')
 _STRIP_INLINE_RE = re.compile(r"//.*")
 
-# Regexes used by _scan_console_statements to strip noise before testing a line
-_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
-_INLINE_COMMENT_RE = re.compile(r"//.*")
-_STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|`(?:[^`\\]|\\.)*`')
 
 # DER OID sequence for rsaEncryption (used when wrapping PKCS#1 → PKCS#8)
 _RSA_OID_SEQ = bytes([
@@ -1939,32 +1935,6 @@ async def handle_pull_request_review_submitted(payload: dict, env=None) -> None:
     await _track_review_in_d1(payload, env)
 
 
-async def _ensure_label_exists(
-    owner: str, repo: str, name: str, color: str, token: str
-) -> None:
-    """Create a label if it does not already exist, or update its colour."""
-    resp = await github_api(
-        "GET",
-        f"/repos/{owner}/{repo}/labels/{_url_quote(name, safe='')}",
-        token,
-    )
-    if resp.status == 404:
-        await github_api(
-            "POST",
-            f"/repos/{owner}/{repo}/labels",
-            token,
-            {"name": name, "color": color},
-        )
-    elif resp.status == 200:
-        data = json.loads(await resp.text())
-        if data.get("color") != color:
-            await github_api(
-                "PATCH",
-                f"/repos/{owner}/{repo}/labels/{_url_quote(name, safe='')}",
-                token,
-                {"color": color},
-            )
-
 async def check_unresolved_conversations(payload, token):
     """Add label if PR has unresolved review conversations"""
     pr = payload.get("pull_request")
@@ -2018,8 +1988,6 @@ async def check_unresolved_conversations(payload, token):
         .get("nodes", [])
     )
 
-    unresolved = any(not t.get("isResolved", True) for t in threads)
-
     unresolved_count = sum(not t.get("isResolved", True) for t in threads)
 
     # Remove any existing unresolved-conversations labels
@@ -2039,11 +2007,8 @@ async def check_unresolved_conversations(payload, token):
                 )
 
     label = f"unresolved-conversations: {unresolved_count}"
-
-    if unresolved:
-        await _ensure_label_exists(owner, repo, label, "e74c3c", token)
-    else:
-        await _ensure_label_exists(owner, repo, label, "5cb85c", token)
+    color = "e74c3c" if unresolved_count else "5cb85c"
+    await ensure_label_exists(owner, repo, label, color, "", token)
 
     await github_api(
         "POST",
@@ -2131,31 +2096,26 @@ async def get_valid_reviewers(owner: str, repo: str, pr_number: int, pr_author: 
     return list(valid_reviewers)
 
 
-async def ensure_label_exists(owner: str, repo: str, label_name: str, color: str, description: str, token: str) -> None:
+async def ensure_label_exists(owner: str, repo: str, label_name: str, color: str, description: str = "", token: str = "") -> None:
     """Create or update a label to ensure it exists with the correct color/description."""
-    resp = await github_api("GET", f"/repos/{owner}/{repo}/labels/{label_name}", token)
-    
+    encoded = _url_quote(label_name, safe="")
+    resp = await github_api("GET", f"/repos/{owner}/{repo}/labels/{encoded}", token)
     if resp.status == 200:
-        # Label exists, check if it needs update
         data = json.loads(await resp.text())
-        if data.get("color") != color or data.get("description") != description:
-            update_resp = await github_api("PATCH", f"/repos/{owner}/{repo}/labels/{label_name}", token, {
-                "color": color,
-                "description": description,
-            })
+        if data.get("color") != color or (description and data.get("description") != description):
+            body = {"color": color}
+            if description:
+                body["description"] = description
+            update_resp = await github_api("PATCH", f"/repos/{owner}/{repo}/labels/{encoded}", token, body)
             if update_resp.status not in (200, 201):
-                error_text = await update_resp.text() if update_resp.status >= 400 else ""
-                console.error(f"[BLT] Failed to update label {label_name}: {update_resp.status} {error_text}")
+                console.error(f"[BLT] Failed to update label {label_name}: {update_resp.status}")
     elif resp.status == 404:
-        # Label doesn't exist, create it
-        create_resp = await github_api("POST", f"/repos/{owner}/{repo}/labels", token, {
-            "name": label_name,
-            "color": color,
-            "description": description,
-        })
+        body = {"name": label_name, "color": color}
+        if description:
+            body["description"] = description
+        create_resp = await github_api("POST", f"/repos/{owner}/{repo}/labels", token, body)
         if create_resp.status not in (200, 201):
-            error_text = await create_resp.text() if create_resp.status >= 400 else ""
-            console.error(f"[BLT] Failed to create label {label_name}: {create_resp.status} {error_text}")
+            console.error(f"[BLT] Failed to create label {label_name}: {create_resp.status}")
 
 
 async def update_peer_review_labels(owner: str, repo: str, pr_number: int, has_review: bool, token: str) -> None:
@@ -2287,7 +2247,7 @@ async def update_check_run(
 ) -> None:
     """Complete a GitHub check run. GitHub caps annotations at 50 per request."""
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    await github_api(
+    resp = await github_api(
         "PATCH",
         f"/repos/{owner}/{repo}/check-runs/{check_run_id}",
         token,
@@ -2298,6 +2258,16 @@ async def update_check_run(
             "output": {"title": title, "summary": summary, "annotations": annotations[:50]},
         },
     )
+    if resp.status not in (200, 201):
+        body = await resp.text()
+        console.error(
+            f"[Checks] Failed to update check run: owner={owner} repo={repo} "
+            f"check_run_id={check_run_id} status={resp.status} response={body}"
+        )
+        raise RuntimeError(
+            f"update_check_run failed for {owner}/{repo}#{check_run_id}: "
+            f"HTTP {resp.status} — {body}"
+        )
 
 
 # ---------------------------------------------------------------------------
