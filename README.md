@@ -11,6 +11,7 @@
   - [Pull Request Automation](#-pull-request-automation)
   - [Contribution Leaderboard](#-contribution-leaderboard)
   - [Bug Reporting](#-bug-reporting)
+  - [Mentor Pool](#-mentor-pool)
   - [Landing Page & Status](#-landing-page--status)
 - [Architecture](#architecture)
 - [Setup](#setup)
@@ -63,7 +64,7 @@ The leaderboard is **event-driven and backed by Cloudflare D1** — no per-reque
 | PR merged | +10 merged PRs, −1 open PR counter |
 | PR closed without merge | −2 closed PRs, −1 open PR counter |
 | PR review submitted | +5 (first two unique reviewers per PR per month only) |
-| Issue comment created | +1 (bots and CodeRabbit pings excluded) |
+| Issue comment created | +2 (bots and CodeRabbit pings excluded) |
 
 **Commands & automation:**
 
@@ -89,9 +90,57 @@ The Worker serves a mentor directory at `/` and a GitHub App install/status page
 
 A post-installation success page is served at `/callback`.
 
-### 🤝 Mentor Pool Directory
+### 🤝 Mentor Pool
 
-BLT-Pool also serves a mentor directory at `/` to support contributors with visible mentor availability and assignment context. The GitHub App docs and install flow are served at `/github-app`.
+BLT-Pool provides a full mentor matching and assignment system for OWASP BLT contributors.
+
+**Slash commands (on issues only):**
+
+| Command | Who | Description |
+|---|---|---|
+| `/mentor` | Contributor | Request mentorship on the current issue. Triggers capacity-aware mentor selection and posts an assignment comment. |
+| `/rematch` | Contributor | Request a different mentor (replaces the current assignment while keeping the issue mentored). |
+| `/handoff` | Assigned mentor | Transfer mentorship to another available mentor. Only the currently assigned mentor can use this. |
+| `/mentor-pause` | Mentor | Acknowledge a pause request; prompts the mentor to open a PR setting `active: false` in `.github/mentors.yml`. |
+
+**Label-based trigger:**
+
+Adding the `needs-mentor` label to an issue triggers automatic mentor assignment (uses the issue's first assignee, or the issue author as the contributor).
+
+**Mentor selection algorithm:**
+1. Filter to active mentors with a GitHub username.
+2. Prefer mentors whose specialties match the issue's labels.
+3. Query open mentored-issue counts (load map) via GitHub Search API.
+4. Reject mentors at or over their `max_mentees` capacity.
+5. Return the mentor with the fewest active mentees — ties broken alphabetically.
+
+**PR integration:**
+- When a PR body references a mentored issue (`Closes/Fixes/Resolves #N`), the assigned mentor is automatically requested as a reviewer.
+- Optionally, a round-robin mentor can be requested as a reviewer on every new PR regardless of linked issues (controlled by `MENTOR_AUTO_PR_REVIEWER_ENABLED`).
+
+**Stale assignment cleanup:**
+- A cron job runs every 2 hours and releases mentor assignments on issues idle for more than **14 days** (based on the last human comment, not bot comments).
+
+**Security bypass:**
+- Issues labelled `security`, `vulnerability`, `security-sensitive`, or `private-security` skip mentor auto-assignment entirely.
+
+**Configuration:**
+- Mentor roster is loaded from `.github/mentors.yml` in the target repository at runtime. Falls back to the built-in `MENTORS` list when the file is absent.
+- Example `.github/mentors.yml` entry:
+  ```yaml
+  mentors:
+    - github_username: alice
+      name: Alice Smith
+      specialties:
+        - frontend
+        - javascript
+      max_mentees: 3
+      active: true
+  ```
+
+**Web directory:**
+
+The mentor pool is also exposed as a public directory at `/` — a live grid of all mentors with availability status, specialties, capacity, and GitHub links. A referral leaderboard shows which users have invited the most mentors.
 
 ---
 
@@ -107,16 +156,28 @@ Cloudflare Worker (src/worker.py)
       ├── Event routing → handler functions
       │
       ├── Issue handlers
-      │   ├── handle_issue_comment   (/assign, /unassign, /leaderboard)
+      │   ├── handle_issue_comment   (/assign, /unassign, /leaderboard, /mentor, /mentor-pause, /handoff, /rematch)
       │   ├── handle_issue_opened    (welcome message, bug report)
-      │   └── handle_issue_labeled   (bug report on label add)
+      │   └── handle_issue_labeled   (bug report on label add; needs-mentor → mentor assignment)
       │
       ├── PR handlers
-      │   ├── handle_pull_request_opened   (welcome, leaderboard, excess-PR check, unresolved-conversations)
+      │   ├── handle_pull_request_opened   (welcome, leaderboard, excess-PR check, unresolved-conversations, mentor reviewer)
       │   ├── handle_pull_request_closed   (merge congrats, leaderboard, D1 tracking)
       │   ├── handle_pull_request_review_submitted  (D1 review tracking)
-      │   ├── handle_pull_request_for_review         (peer review label + comment)
+      │   ├── handle_pull_request_for_review         (peer review label + comment, pending-checks label)
       │   └── handle_pull_request_review             (peer review label update on dismiss)
+      │
+      ├── Mentor Pool engine
+      │   ├── _select_mentor           (capacity-aware round-robin with specialty matching)
+      │   ├── _assign_mentor_to_issue  (label + comment + reviewer request)
+      │   ├── handle_mentor_command    (/mentor)
+      │   ├── handle_mentor_handoff    (/handoff)
+      │   ├── handle_mentor_rematch    (/rematch)
+      │   └── handle_mentor_pause      (/mentor-pause)
+      │
+      ├── CI/Checks handlers
+      │   ├── handle_workflow_run   (workflow_run events → pending-checks label)
+      │   └── handle_check_run      (check_run created/completed → pending-checks label)
       │
       ├── Leaderboard engine
       │   ├── D1-backed event counters (open/merged/closed PRs, reviews, comments)
@@ -124,7 +185,8 @@ Cloudflare Worker (src/worker.py)
       │   └── Formatted leaderboard comment builder
       │
       └── Cron scheduler (every 2 hours)
-          └── _check_stale_assignments → auto-unassign expired issues
+          ├── _check_stale_assignments       → auto-unassign expired issue contributors
+          └── _check_stale_mentor_assignments → release mentor assignments idle > 14 days
 ```
 
 ### Leaderboard Scalability
@@ -153,9 +215,11 @@ The leaderboard uses an **event-driven D1 model**:
 | `PRIVATE_KEY` | ✅ | GitHub App RSA private key (full PEM, PKCS#1 or PKCS#8) |
 | `WEBHOOK_SECRET` | ✅ | GitHub App webhook secret |
 | `GITHUB_APP_SLUG` | ⬜ | App URL slug shown in GitHub App URLs (e.g. `blt-pool`). Defaults to empty string — install button falls back to a generic URL. |
-| `BLT_API_URL` | ⬜ | BLT API base URL (default: `https://blt-api.owasp-blt.workers.dev`) |
+| `BLT_API_URL` | ⬜ | BLT API base URL (default: `https://github-app.owaspblt.org`) |
 | `GITHUB_CLIENT_ID` | ⬜ | OAuth client ID (optional, for OAuth flow) |
 | `GITHUB_CLIENT_SECRET` | ⬜ | OAuth client secret (optional, for OAuth flow) |
+| `ADMIN_SECRET` | ⬜ | Bearer token to authorize `POST /admin/reset-leaderboard-month` (optional) |
+| `MENTOR_AUTO_PR_REVIEWER_ENABLED` | ⬜ | Set to `true` to automatically request a round-robin mentor as reviewer on every new PR regardless of linked issues (optional, default: `false`) |
 
 Non-secret variables (`BLT_API_URL`, `GITHUB_APP_SLUG`) are committed to `wrangler.toml`. Secrets must be set via Wrangler.
 
@@ -226,11 +290,13 @@ pytest test_worker.py -v
 
 | Permission | Access | Why |
 |---|---|---|
-| Issues | Read & Write | Assignment, comments, bug reporting |
-| Pull Requests | Read & Write | PR automation, leaderboard, peer review |
+| Issues | Read & Write | Assignment, comments, bug reporting, mentor labels |
+| Pull Requests | Read & Write | PR automation, leaderboard, peer review, mentor reviewer requests |
 | Metadata | Read | Repository info |
+| Checks | Read | Pending-checks label updates |
+| Actions | Read | Workflow run pending-checks tracking |
 
-**Subscribed webhook events:** `issue_comment`, `issues`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`
+**Subscribed webhook events:** `issue_comment`, `issues`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `check_run`, `workflow_run`
 
 ---
 
@@ -291,7 +357,6 @@ Everything below is planned for future development. Items are ordered roughly by
 | **Last-active label** | Automatically marks PRs that have been idle for a configurable time window to surface stale work. |
 | **Bounty payout integration** | When a PR merges and closes an issue carrying a `$amount` label, trigger the BLT bounty payout API automatically. |
 | **Reviewer suggestions** | Suggest relevant reviewers based on file ownership history and past contribution patterns. |
-| **Mentor Pool Assignment System** | Add a GitHub Action-backed mentor pool workflow to distribute mentorship fairly and consistently: auto-assign mentors for supported issues (and optional PR guidance), balance mentor load with capacity-aware rotation, support transparent assignment tracking and safe reassignment, and keep contributor guidance timely as the community grows. |
 
 ---
 
