@@ -46,9 +46,8 @@
 
 | Feature | Description |
 |---|---|
-| **Welcome message** | New PRs receive a checklist comment (code style, tests, commit messages, linked issue). |
 | **Merge congratulations** | A celebratory comment is posted when a PR is merged, crediting the author. |
-| **Auto-close excess PRs** | If an author has more than **50 open PRs** in the repository, the new PR is automatically closed with an explanatory message. |
+| **Auto-close excess PRs** | If an author already has **50 or more open PRs** in the repository, the new PR is automatically closed with an explanatory message. |
 | **Peer review enforcement** | PRs are labeled `needs-peer-review` or `has-peer-review` based on whether a valid (non-bot, non-author) approval exists. A reminder comment is posted when a review is missing. |
 | **Unresolved conversations label** | Every PR is labeled `unresolved-conversations: N` (🔴 red if any are open, 🟢 green if all resolved), updated automatically whenever the PR is opened or a review thread changes. |
 
@@ -126,6 +125,7 @@ Adding the `needs-mentor` label to an issue triggers automatic mentor assignment
 
 **Configuration:**
 - Mentor roster is loaded from `.github/mentors.yml` in the target repository at runtime. Falls back to the built-in `MENTORS` list when the file is absent.
+- Mentor records support optional `referred_by`, which powers the homepage referral leaderboard widget.
 - Example `.github/mentors.yml` entry:
   ```yaml
   mentors:
@@ -136,11 +136,21 @@ Adding the `needs-mentor` label to an issue triggers automatic mentor assignment
         - javascript
       max_mentees: 3
       active: true
+      referred_by: bob
   ```
 
 **Web directory:**
 
-The mentor pool is also exposed as a public directory at `/` — a live grid of all mentors with availability status, specialties, capacity, and GitHub links. A referral leaderboard shows which users have invited the most mentors.
+The mentor pool is also exposed as a public directory at `/` — a live grid of all mentors with availability status, specialties, capacity, and GitHub links.
+
+**Referral leaderboard:**
+- The homepage includes a live "Referral Leaderboard" generated from mentor entries that include `referred_by`.
+- Rankings are calculated by counting how many mentor entries each referrer has in `.github/mentors.yml`.
+
+**Mentor application automation:**
+- The homepage "Become a Mentor" form and the GitHub issue template feed into an automated pipeline.
+- `.github/workflows/add-mentor-from-issue.yml` listens to newly opened mentor application issues.
+- `.github/scripts/add_mentor.py` parses and validates fields, appends the mentor entry to `.github/mentors.yml`, commits directly to the default branch, comments on the issue, and closes it.
 
 ---
 
@@ -161,7 +171,7 @@ Cloudflare Worker (src/worker.py)
       │   └── handle_issue_labeled   (bug report on label add; needs-mentor → mentor assignment)
       │
       ├── PR handlers
-      │   ├── handle_pull_request_opened   (welcome, leaderboard, excess-PR check, unresolved-conversations, mentor reviewer)
+      │   ├── handle_pull_request_opened   (leaderboard, excess-PR check, unresolved-conversations, mentor reviewer)
       │   ├── handle_pull_request_closed   (merge congrats, leaderboard, D1 tracking)
       │   ├── handle_pull_request_review_submitted  (D1 review tracking)
       │   ├── handle_pull_request_for_review         (peer review label + comment, pending-checks label)
@@ -215,7 +225,8 @@ The leaderboard uses an **event-driven D1 model**:
 | `PRIVATE_KEY` | ✅ | GitHub App RSA private key (full PEM, PKCS#1 or PKCS#8) |
 | `WEBHOOK_SECRET` | ✅ | GitHub App webhook secret |
 | `GITHUB_APP_SLUG` | ⬜ | App URL slug shown in GitHub App URLs (e.g. `blt-pool`). Defaults to empty string — install button falls back to a generic URL. |
-| `BLT_API_URL` | ⬜ | BLT API base URL (default: `https://github-app.owaspblt.org`) |
+| `BLT_API_URL` | ⬜ | BLT API base URL (`wrangler.toml` sets `https://github-app.owaspblt.org`; runtime fallback in code is `https://blt-api.owasp-blt.workers.dev`) |
+| `GITHUB_TOKEN` | ⬜ | Optional GitHub token used by `GET /` to fetch `.github/mentors.yml` with higher API rate limits (avoids unauthenticated 60 req/h limits). |
 | `GITHUB_CLIENT_ID` | ⬜ | OAuth client ID (optional, for OAuth flow) |
 | `GITHUB_CLIENT_SECRET` | ⬜ | OAuth client secret (optional, for OAuth flow) |
 | `ADMIN_SECRET` | ⬜ | Bearer token to authorize `POST /admin/reset-leaderboard-month` (optional) |
@@ -318,9 +329,16 @@ pytest test_worker.py -v
 ```text
 BLT-Pool/
 ├── .dev.vars.example            # Local development variables template
-├── .github/workflows/
-│   ├── node-ci.yml              # Node.js CI workflow
-│   └── python-ci.yml            # Python CI workflow
+├── .github/
+│   ├── ISSUE_TEMPLATE/
+│   │   └── mentor-application.md      # Mentor application issue template
+│   ├── scripts/
+│   │   └── add_mentor.py              # Parser/validator used by mentor onboarding workflow
+│   ├── workflows/
+│   │   ├── add-mentor-from-issue.yml  # Auto-add mentors from application issues
+│   │   ├── node-ci.yml                # Node.js CI workflow
+│   │   └── python-ci.yml              # Python CI workflow
+│   └── mentors.yml                    # Mentor pool source of truth (used at runtime)
 ├── src/
 │   ├── worker.py              # Main Cloudflare Worker — all webhook handlers, leaderboard engine, landing page
 │   └── index_template.py      # Landing page HTML template
