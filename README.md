@@ -121,7 +121,7 @@ Adding the `needs-mentor` label to an issue triggers automatic mentor assignment
 - A cron job runs every 2 hours and releases mentor assignments on issues idle for more than **14 days** (based on the last human comment, not bot comments).
 
 **Security bypass:**
-- Issues labelled `security`, `vulnerability`, `security-sensitive`, or `private-security` skip mentor auto-assignment entirely.
+- Issues labeled `security`, `vulnerability`, `security-sensitive`, or `private-security` skip mentor auto-assignment entirely.
 
 **Configuration:**
 - Mentor roster is loaded from `.github/mentors.yml` in the target repository at runtime. Falls back to the built-in `MENTORS` list when the file is absent.

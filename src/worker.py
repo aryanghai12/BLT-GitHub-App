@@ -3139,14 +3139,11 @@ async def _assign_round_robin_mentor_reviewer(
 ) -> None:
     """Auto-request one mentor as a reviewer on a newly opened PR (round-robin).
 
-    Enabled only when ``MENTOR_AUTO_PR_REVIEWER_ENABLED`` is ``True``.
+    Called only when round-robin auto-reviewer mode is enabled.
     Picks one active mentor using ``(pr_number - 1) mod pool_size`` so the
     assignment cycles predictably across consecutive PRs.  The PR author is
     never chosen as their own reviewer.
     """
-    if not MENTOR_AUTO_PR_REVIEWER_ENABLED:
-        return
-
     pool = mentors_config if mentors_config is not None else MENTORS
     active = [
         m for m in pool
