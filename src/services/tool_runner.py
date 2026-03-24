@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal, Optional
 
@@ -46,6 +47,34 @@ def _default_error_summary(name: str, error_message: str, attempts: int) -> dict
 def _sanitize_error_message(message: str, *, max_len: int = 160) -> str:
     """Sanitize exception text before exposing it in checks output or logs."""
     cleaned = " ".join((message or "").split())
+
+    redaction_rules = [
+        # Windows absolute paths (e.g. C:\Users\name\file.txt)
+        (re.compile(r"\b[A-Za-z]:\\[^\s]+"), "[REDACTED_PATH]"),
+        # Unix-style absolute and home-relative paths
+        (re.compile(r"\b~\/[^\s]+"), "[REDACTED_PATH]"),
+        (
+            re.compile(r"\/(?:home|Users|var|etc|tmp|opt|srv|mnt|private|root)\/[^\s]+"),
+            "[REDACTED_PATH]",
+        ),
+        # Email addresses
+        (
+            re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+            "[REDACTED_EMAIL]",
+        ),
+        # Key-value style secrets and token-like identifiers
+        (
+            re.compile(
+                r"(?i)\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*[^\s,;]+"
+            ),
+            "[REDACTED_SECRET]",
+        ),
+        (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "[REDACTED_SECRET]"),
+        (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "[REDACTED_SECRET]"),
+    ]
+    for pattern, replacement in redaction_rules:
+        cleaned = pattern.sub(replacement, cleaned)
+
     if not cleaned:
         return "internal error"
     if len(cleaned) > max_len:
@@ -80,6 +109,27 @@ async def run_tool_with_retries(
     for attempt in range(1, attempts_allowed + 1):
         try:
             output = await asyncio.wait_for(runner(), timeout=timeout_seconds)
+            if not isinstance(output, dict):
+                output_repr = _sanitize_error_message(repr(output), max_len=300)
+                err = _sanitize_error_message(
+                    f"invalid runner return type: {type(output).__name__}"
+                )
+                return ToolRunResult(
+                    name=name,
+                    status="error",
+                    attempt_count=attempt,
+                    timed_out=False,
+                    error=err,
+                    output={
+                        "title": f"{name} failed",
+                        "summary": (
+                            f"Runner returned an invalid payload type ({type(output).__name__}). "
+                            "Marked neutral for safe fallback."
+                        ),
+                        "raw_output_preview": output_repr,
+                    },
+                    conclusion="neutral",
+                )
             return ToolRunResult(
                 name=name,
                 status="success",

@@ -116,6 +116,53 @@ def test_run_tool_with_retries_exception_neutral_after_exhaustion():
     assert "boom" in result.output["summary"]
 
 
+def test_run_tool_with_retries_invalid_output_type_returns_error():
+    async def runner():
+        return "not-a-dict"
+
+    result = _run(
+        run_tool_with_retries(
+            name="Trivy",
+            runner=runner,
+            timeout_seconds=1,
+            max_retries=1,
+        )
+    )
+
+    assert result.status == "error"
+    assert result.attempt_count == 1
+    assert result.conclusion == "neutral"
+    assert "invalid runner return type" in result.error
+    assert result.output["raw_output_preview"] == "'not-a-dict'"
+
+
+def test_run_tool_with_retries_redacts_sensitive_exception_text():
+    async def runner():
+        raise RuntimeError(
+            "token=ghp_abcdefghijklmnopqrstuvwxyz123456 "
+            "path=C:\\Users\\alice\\secrets.txt "
+            "email=alice@example.com "
+            "hash=abcdefabcdefabcdefabcdefabcdefab"
+        )
+
+    result = _run(
+        run_tool_with_retries(
+            name="Semgrep",
+            runner=runner,
+            timeout_seconds=1,
+            max_retries=0,
+        )
+    )
+
+    assert result.status == "error"
+    assert "[REDACTED_SECRET]" in result.error
+    assert "[REDACTED_EMAIL]" in result.error
+    assert "[REDACTED_PATH]" in result.error
+    assert "alice@example.com" not in result.error
+    assert "C:\\Users\\alice\\secrets.txt" not in result.error
+    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in result.error
+
+
 def test_run_tool_with_retries_rejects_invalid_settings():
     async def runner():
         return {"title": "ok", "summary": "ok"}
