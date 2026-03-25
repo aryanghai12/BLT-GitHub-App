@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal, Optional
@@ -49,14 +50,10 @@ def _sanitize_error_message(message: str, *, max_len: int = 160) -> str:
     cleaned = " ".join((message or "").split())
 
     redaction_rules = [
-        # Windows absolute paths (e.g. C:\Users\name\file.txt)
-        (re.compile(r"\b[A-Za-z]:\\[^\s]+"), "[REDACTED_PATH]"),
-        # Unix-style absolute and home-relative paths
-        (re.compile(r"~\/[^\s]+"), "[REDACTED_PATH]"),
-        (
-            re.compile(r"\/(?:home|Users|var|etc|tmp|opt|srv|mnt|private|root)\/[^\s]+"),
-            "[REDACTED_PATH]",
-        ),
+        # Windows and Unix/home path patterns.
+        (re.compile(r"(^|[\s=:(\[\{])[A-Za-z]:\\[^\s]+"), r"\1[REDACTED_PATH]"),
+        (re.compile(r"(^|[\s=:(\[\{])\/[^\s]+"), r"\1[REDACTED_PATH]"),
+        (re.compile(r"(^|[\s=:(\[\{])~\/[^\s]+"), r"\1[REDACTED_PATH]"),
         # Email addresses
         (
             re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
@@ -69,7 +66,22 @@ def _sanitize_error_message(message: str, *, max_len: int = 160) -> str:
             ),
             "[REDACTED_SECRET]",
         ),
+        (
+            re.compile(r"(?i)\b(access_token|id_token|refresh_token)=([^&\s]+)"),
+            r"\1=[REDACTED_SECRET]",
+        ),
         (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "[REDACTED_SECRET]"),
+        (
+            re.compile(
+                r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b"
+            ),
+            "[REDACTED_SECRET]",
+        ),
+        (
+            re.compile(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+            "[REDACTED_SECRET]",
+        ),
+        (re.compile(r"\b[A-Za-z0-9+/_-]{40,}={0,2}\b"), "[REDACTED_SECRET]"),
         (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "[REDACTED_SECRET]"),
     ]
     for pattern, replacement in redaction_rules:
@@ -97,10 +109,25 @@ async def run_tool_with_retries(
     - Timeout and unexpected exceptions are converted to neutral fallback results.
     - Callers can use `conclusion` directly when mapping to Checks API updates.
     """
+    if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool):
+        raise ValueError("timeout_seconds must be a finite number")
+    if not math.isfinite(timeout_seconds):
+        raise ValueError("timeout_seconds must be a finite number")
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero")
+    if not isinstance(max_retries, int) or isinstance(max_retries, bool):
+        if isinstance(max_retries, (int, float)) and not isinstance(max_retries, bool):
+            if not math.isfinite(max_retries):
+                raise ValueError("max_retries must be a finite integer")
+        raise ValueError("max_retries must be an integer")
     if max_retries < 0:
         raise ValueError("max_retries cannot be negative")
+    if not isinstance(retry_delay_seconds, (int, float)) or isinstance(
+        retry_delay_seconds, bool
+    ):
+        raise ValueError("retry_delay_seconds must be a finite number")
+    if not math.isfinite(retry_delay_seconds):
+        raise ValueError("retry_delay_seconds must be a finite number")
     if retry_delay_seconds < 0:
         raise ValueError("retry_delay_seconds cannot be negative")
 

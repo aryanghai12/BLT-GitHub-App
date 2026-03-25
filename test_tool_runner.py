@@ -3,7 +3,7 @@
 import asyncio
 import pytest
 
-from services.tool_runner import run_tool_with_retries
+from services.tool_runner import _sanitize_error_message, run_tool_with_retries
 
 
 def _run(coro):
@@ -165,6 +165,29 @@ def test_run_tool_with_retries_redacts_sensitive_exception_text():
     assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in result.error
 
 
+def test_sanitize_error_message_redacts_generic_patterns():
+    raw = (
+        "unix=/very/custom/root/secret.txt "
+        "win=C:\\private\\key.bin "
+        "home=~/vault/token.json "
+        "uuid=123e4567-e89b-12d3-a456-426614174000 "
+        "jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4iLCJhZG1pbiI6dHJ1ZX0."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c "
+        "access_token=abc123secretvalue"
+    )
+
+    sanitized = _sanitize_error_message(raw, max_len=500)
+
+    assert "[REDACTED_PATH]" in sanitized
+    assert "[REDACTED_SECRET]" in sanitized
+    assert "access_token=[REDACTED_SECRET]" in sanitized
+    assert "/very/custom/root/secret.txt" not in sanitized
+    assert "C:\\private\\key.bin" not in sanitized
+    assert "~/vault/token.json" not in sanitized
+    assert "123e4567-e89b-12d3-a456-426614174000" not in sanitized
+
+
 def test_run_tool_with_retries_rejects_invalid_settings():
     async def runner():
         return {"title": "ok", "summary": "ok"}
@@ -192,6 +215,24 @@ def test_run_tool_with_retries_rejects_invalid_settings():
             run_tool_with_retries(
                 name="ESLint",
                 runner=runner,
+                timeout_seconds=float("nan"),
+            )
+        )
+
+    with pytest.raises(ValueError):
+        _run(
+            run_tool_with_retries(
+                name="ESLint",
+                runner=runner,
+                timeout_seconds=float("inf"),
+            )
+        )
+
+    with pytest.raises(ValueError):
+        _run(
+            run_tool_with_retries(
+                name="ESLint",
+                runner=runner,
                 timeout_seconds=1,
                 max_retries=-1,
             )
@@ -203,6 +244,26 @@ def test_run_tool_with_retries_rejects_invalid_settings():
                 name="ESLint",
                 runner=runner,
                 timeout_seconds=1,
+                max_retries=float("nan"),
+            )
+        )
+
+    with pytest.raises(ValueError):
+        _run(
+            run_tool_with_retries(
+                name="ESLint",
+                runner=runner,
+                timeout_seconds=1,
                 retry_delay_seconds=-1,
+            )
+        )
+
+    with pytest.raises(ValueError):
+        _run(
+            run_tool_with_retries(
+                name="ESLint",
+                runner=runner,
+                timeout_seconds=1,
+                retry_delay_seconds=float("inf"),
             )
         )
