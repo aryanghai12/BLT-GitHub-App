@@ -1742,6 +1742,11 @@ class TestPostMergedPrCombinedComment(unittest.TestCase):
         self._run(self._make_leaderboard_data(), "alice", [], posted, deleted)
         self.assertIn("pool.owaspblt.org", posted[0])
 
+    def test_combined_comment_contains_current_repository_link(self):
+        posted, deleted = [], []
+        self._run(self._make_leaderboard_data(), "alice", [], posted, deleted)
+        self.assertIn("[test-org/test-repo](https://github.com/test-org/test-repo)", posted[0])
+
     def test_combined_comment_contains_contributor_leaderboard(self):
         posted, deleted = [], []
         self._run(self._make_leaderboard_data(), "alice", [], posted, deleted)
@@ -3532,6 +3537,128 @@ class TestBackfillReviewCredits(unittest.TestCase):
 
         _run(_inner())
 
+    def test_tracked_merged_prs_filtered_to_current_month(self):
+        """leaderboard_pr_state query for tracked merged PRs must include the month window filter."""
+        async def _inner():
+            mock_db = self._make_mock_db()
+            env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
+            start_ts, end_ts = _worker._month_window("2026-03")
+
+            # No PRs from the GitHub API for the current month.
+            open_prs = []
+            closed_prs = []
+
+            d1_all_calls = []  # (sql, params) tuples
+
+            async def _capturing_d1_all(db, sql, params=()):
+                d1_all_calls.append((sql, params))
+                return []
+
+            async def _mock_api(method, path, token, body=None):
+                if "state=open" in path:
+                    return self._make_api_response(open_prs)
+                if "state=closed" in path:
+                    return self._make_api_response(closed_prs)
+                return self._make_api_response([])
+
+            with patch.object(_worker, "github_api", new=_mock_api):
+                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch.object(_worker, "_d1_all", new=_capturing_d1_all):
+                        with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
+                            with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock()):
+                                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                                    await _worker._backfill_repo_month_if_needed(
+                                        "OWASP-BLT", "test-repo", "tok", env,
+                                        month_key="2026-03", start_ts=start_ts, end_ts=end_ts,
+                                    )
+
+            # Find the _d1_all call for leaderboard_pr_state merged PR lookup.
+            pr_state_calls = [
+                (sql, params)
+                for sql, params in d1_all_calls
+                if "leaderboard_pr_state" in sql and "merged = 1" in sql
+            ]
+            self.assertTrue(
+                len(pr_state_calls) > 0,
+                "Expected a _d1_all call for leaderboard_pr_state merged PR lookup",
+            )
+            for sql, params in pr_state_calls:
+                self.assertIn(
+                    "closed_at", sql,
+                    "leaderboard_pr_state merged PR query must filter by closed_at",
+                )
+                self.assertIn(start_ts, params, "start_ts must be a param in the merged PR query")
+                self.assertIn(end_ts, params, "end_ts must be a param in the merged PR query")
+
+        _run(_inner())
+
+    def test_previous_month_tracked_prs_not_credited_in_current_month(self):
+        """PRs merged in a previous month must not generate review credits in the current month."""
+        async def _inner():
+            mock_db = self._make_mock_db()
+            env = types.SimpleNamespace(LEADERBOARD_DB=mock_db)
+            start_ts, end_ts = _worker._month_window("2026-03")
+
+            # No PRs visible from the GitHub API for the current month window.
+            open_prs = []
+            closed_prs = []  # No current-month merged PRs returned by API.
+
+            review_api_calls = []
+
+            async def _mock_api(method, path, token, body=None):
+                if "state=open" in path:
+                    return self._make_api_response(open_prs)
+                if "state=closed" in path:
+                    return self._make_api_response(closed_prs)
+                if "/reviews" in path:
+                    review_api_calls.append(path)
+                    return self._make_api_response([
+                        {"user": {"login": "bob", "type": "User"}, "state": "APPROVED"},
+                    ])
+                return self._make_api_response([])
+
+            monthly_inc_calls = []
+
+            async def _capturing_d1_all(db, sql, params=()):
+                # Return a previous-month merged PR only for the pr_state lookup.
+                if "leaderboard_pr_state" in sql and "merged = 1" in sql:
+                    # With the fix, start_ts/end_ts are passed so this row
+                    # would be excluded by the real D1 query.  Simulate correct
+                    # behaviour: the DB would return nothing for out-of-window rows.
+                    if start_ts in params and end_ts in params:
+                        return []
+                    # Without the fix the query had no date params; return the
+                    # out-of-window row to expose the bug.
+                    return [{"pr_number": 99, "author_login": "alice"}]
+                return []
+
+            with patch.object(_worker, "github_api", new=_mock_api):
+                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch.object(_worker, "_d1_all", new=_capturing_d1_all):
+                        with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
+                            with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock(
+                                side_effect=lambda db, org, mk, login, field, delta=1: monthly_inc_calls.append((login, field))
+                            )):
+                                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                                    await _worker._backfill_repo_month_if_needed(
+                                        "OWASP-BLT", "test-repo", "tok", env,
+                                        month_key="2026-03", start_ts=start_ts, end_ts=end_ts,
+                                    )
+
+            # With the fix applied, the previous-month PR should NOT generate review
+            # API calls or review credits because the DB query excludes it.
+            self.assertEqual(
+                len(review_api_calls), 0,
+                "Reviews must not be fetched for PRs merged outside the current month",
+            )
+            review_credits = [login for login, field in monthly_inc_calls if field == "reviews"]
+            self.assertEqual(
+                len(review_credits), 0,
+                "No review credits should be awarded for PRs from a previous month",
+            )
+
+        _run(_inner())
+
 
 # ---------------------------------------------------------------------------
 # Admin reset endpoint tests
@@ -4073,6 +4200,7 @@ class TestCheckUnresolvedConversations(unittest.TestCase):
         _run(_inner())
         self.assertTrue(len(comment_bodies) >= 1, "Expected a comment to be posted")
         self.assertIn(_worker.UNRESOLVED_CONVERSATIONS_MARKER, comment_bodies[0])
+        self.assertIn("@alice", comment_bodies[0])
         self.assertIn("1", comment_bodies[0])
 
     def test_updates_existing_comment_when_unresolved(self):
@@ -4959,6 +5087,21 @@ class TestHandleMentorUnassign(unittest.TestCase):
         self.assertTrue(any("assignees" in e for e in endpoints_called))
         self.assertTrue(any("cancelled" in c.lower() for c in comments))
 
+    def test_current_assignee_can_unmentor(self):
+        issue = {
+            "number": 7,
+            "labels": [{"name": "mentor-assigned"}],
+            "assignees": [{"login": "dave"}],
+            "user": {"login": "alice"},
+        }
+        api_calls, comments = [], []
+        # dave is an assignee but not the author or the mentor
+        self._run_unmentor(issue, "dave", "bob", api_calls, comments)
+        endpoints_called = [str(call) for call in api_calls]
+        self.assertTrue(any("labels/mentor-assigned" in e for e in endpoints_called))
+        self.assertTrue(any("assignees" in e for e in endpoints_called))
+        self.assertTrue(any("cancelled" in c.lower() for c in comments))
+
     def test_unrelated_user_cannot_unmentor(self):
         issue = {
             "number": 5,
@@ -5714,6 +5857,13 @@ class TestGenerateMentorRow(unittest.TestCase):
         html = _worker._generate_mentor_row(self._make_mentor(name="Alice Smith"))
         self.assertIn("Alice Smith", html)
 
+    def test_title_and_bio_rendered(self):
+        html = _worker._generate_mentor_row(
+            self._make_mentor(title="Security Mentor", bio="Helps with triage and first PRs.")
+        )
+        self.assertIn("Security Mentor", html)
+        self.assertIn("Helps with triage and first PRs.", html)
+
     def test_xss_in_name_escaped(self):
         # Verify that HTML special characters in name are escaped to prevent XSS.
         html = _worker._generate_mentor_row(self._make_mentor(name='<script>xss</script>'))
@@ -5751,7 +5901,7 @@ class TestGenerateMentorRow(unittest.TestCase):
 
     def test_stats_prs_shown_when_provided(self):
         html = _worker._generate_mentor_row(
-            self._make_mentor(), stats={"merged_prs": 42, "reviews": 7}
+            self._make_mentor(total_prs=42), stats={"reviews": 7}
         )
         self.assertIn("42", html)
         self.assertIn("7", html)
@@ -5793,6 +5943,19 @@ class TestIndexHtml(unittest.TestCase):
         mentors = [{"name": "Bob Smith", "github_username": "bobsmith", "active": True, "status": "available"}]
         html = _worker._index_html(mentors)
         self.assertIn("Bob Smith", html)
+
+    def test_mentor_title_and_bio_appear_in_html(self):
+        mentors = [{
+            "name": "Bob Smith",
+            "github_username": "bobsmith",
+            "title": "AppSec Mentor",
+            "bio": "Focuses on secure code review and onboarding.",
+            "active": True,
+            "status": "available",
+        }]
+        html = _worker._index_html(mentors)
+        self.assertIn("AppSec Mentor", html)
+        self.assertIn("Focuses on secure code review and onboarding.", html)
 
     def test_referral_leaderboard_shown_when_referrals_exist(self):
         mentors = [
@@ -6084,6 +6247,84 @@ class TestOnFetchHomepage(unittest.TestCase):
         _run(_inner())
 
 
+class TestCorsPolicyOnFetch(unittest.TestCase):
+    """Minimal regression tests for PR-1 CORS policy on JSON routes."""
+
+    def _make_request(self, method="GET", path="/", body=None, headers=None):
+        req_headers = _HeadersStub(headers or {})
+        if isinstance(body, str):
+            body_text = body
+        elif body is None:
+            body_text = ""
+        else:
+            body_text = json.dumps(body)
+        return types.SimpleNamespace(
+            method=method,
+            url=f"https://example.com{path}",
+            headers=req_headers,
+            text=AsyncMock(return_value=body_text),
+        )
+
+    def test_health_includes_wildcard_cors_header(self):
+        async def _inner():
+            req = self._make_request(method="GET", path="/health")
+            env = types.SimpleNamespace(APP_ID="123", PRIVATE_KEY="pem", WEBHOOK_SECRET="secret")
+
+            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                resp = await _worker.on_fetch(req, env)
+
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
+
+        _run(_inner())
+
+    def test_api_mentors_success_has_no_cors_header(self):
+        async def _inner():
+            req = self._make_request(
+                method="POST",
+                path="/api/mentors",
+                body={"name": "Jane", "github_username": "jane"},
+            )
+            env = types.SimpleNamespace()
+            with patch.object(_worker, "_handle_add_mentor", new=AsyncMock(return_value=_worker._json({"ok": True}, 201))):
+                resp = await _worker.on_fetch(req, env)
+
+            self.assertEqual(resp.status, 201)
+            self.assertIsNone(resp.headers.get("Access-Control-Allow-Origin"))
+
+        _run(_inner())
+
+    def test_webhook_response_has_no_cors_header(self):
+        async def _inner():
+            req = self._make_request(method="POST", path="/api/github/webhooks", body={"action": "opened"})
+            env = types.SimpleNamespace()
+            with patch.object(_worker, "handle_webhook", new=AsyncMock(return_value=_worker._json({"ok": True}, 200))):
+                resp = await _worker.on_fetch(req, env)
+
+            self.assertEqual(resp.status, 200)
+            self.assertIsNone(resp.headers.get("Access-Control-Allow-Origin"))
+
+        _run(_inner())
+
+    def test_admin_reset_unauthorized_has_no_cors_header(self):
+        async def _inner():
+            req = self._make_request(
+                method="POST",
+                path="/admin/reset-leaderboard-month",
+                body={"org": "OWASP-BLT", "month_key": "2026-03"},
+                headers={"Authorization": "Bearer wrong-secret"},
+            )
+            env = types.SimpleNamespace(ADMIN_SECRET="test-secret", LEADERBOARD_DB=MagicMock())
+
+            with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+                resp = await _worker.on_fetch(req, env)
+
+            self.assertEqual(resp.status, 401)
+            self.assertIsNone(resp.headers.get("Access-Control-Allow-Origin"))
+
+        _run(_inner())
+
+
 class TestHandleAddMentor(unittest.TestCase):
     """POST /api/mentors — inserts a new mentor into D1."""
 
@@ -6159,6 +6400,18 @@ class TestHandleAddMentor(unittest.TestCase):
         data = _json.loads(resp.body)
         self.assertEqual(data["github_username"], "janedoe")
 
+    def test_title_and_bio_forwarded_to_d1(self):
+        resp, captured = self._run_add({
+            "name": "Jane Doe",
+            "github_username": "janedoe",
+            "title": "Security Mentor",
+            "bio": "Helps first-time contributors ship safely.",
+        })
+        self.assertEqual(resp.status, 201)
+        kwargs = captured["add_args"].kwargs
+        self.assertEqual(kwargs["title"], "Security Mentor")
+        self.assertEqual(kwargs["bio"], "Helps first-time contributors ship safely.")
+
     # --- New strict-validation tests ---
 
     def test_name_with_html_tag_returns_400(self):
@@ -6187,6 +6440,14 @@ class TestHandleAddMentor(unittest.TestCase):
 
     def test_name_too_long_returns_400(self):
         resp, _ = self._run_add({"name": "A" * 101, "github_username": "janedoe"})
+        self.assertEqual(resp.status, 400)
+
+    def test_title_with_html_returns_400(self):
+        resp, _ = self._run_add({"name": "Jane Doe", "github_username": "janedoe", "title": "<bad>"})
+        self.assertEqual(resp.status, 400)
+
+    def test_bio_with_html_returns_400(self):
+        resp, _ = self._run_add({"name": "Jane Doe", "github_username": "janedoe", "bio": "<script>bad</script>"})
         self.assertEqual(resp.status, 400)
 
     def test_name_exactly_100_chars_accepted(self):

@@ -43,6 +43,7 @@ from services.check_orchestrator import (
 from services.admin import AdminService, has_merged_pr_in_org
 from services.mentor_seed import INITIAL_MENTORS
 from checks_api import build_update_check_run_payloads
+from version import APP_VERSION
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -224,7 +225,7 @@ def _gh_headers(token: str) -> Headers:
     h = {
         "Accept": "application/vnd.github+json",
         "Content-Type": "application/json",
-        "User-Agent": "BLT-Pool/1.0",
+        "User-Agent": f"BLT-Pool/{APP_VERSION}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     if token:
@@ -253,7 +254,7 @@ async def get_installation_token(
             "Authorization": f"Bearer {jwt}",
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
-            "User-Agent": "BLT-Pool/1.0",
+            "User-Agent": f"BLT-Pool/{APP_VERSION}",
             "X-GitHub-Api-Version": "2022-11-28",
         }.items()),
     )
@@ -273,7 +274,7 @@ async def get_installation_access_token(installation_id: int, jwt_token: str) ->
             "Authorization": f"Bearer {jwt_token}",
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
-            "User-Agent": "BLT-Pool/1.0",
+            "User-Agent": f"BLT-Pool/{APP_VERSION}",
             "X-GitHub-Api-Version": "2022-11-28",
         }.items()),
     )
@@ -544,187 +545,12 @@ async def _d1_first(db, sql: str, params: tuple = ()):
     return rows[0] if rows else None
 
 
-async def _d1_has_column(db, table_name: str, column_name: str) -> bool:
-    """Return True when the table already contains the given column."""
-    try:
-        rows = await _d1_all(db, f"PRAGMA table_info({table_name})")
-    except Exception:
-        return False
-    normalized = (column_name or "").strip().lower()
-    for row in rows:
-        if str(row.get("name") or "").strip().lower() == normalized:
-            return True
-    return False
-
-
 async def _ensure_leaderboard_schema(db) -> None:
-    """Create leaderboard tables if they do not exist."""
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_monthly_stats (
-            org TEXT NOT NULL,
-            month_key TEXT NOT NULL,
-            user_login TEXT NOT NULL,
-            merged_prs INTEGER NOT NULL DEFAULT 0,
-            closed_prs INTEGER NOT NULL DEFAULT 0,
-            reviews INTEGER NOT NULL DEFAULT 0,
-            comments INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, month_key, user_login)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_open_prs (
-            org TEXT NOT NULL,
-            user_login TEXT NOT NULL,
-            open_prs INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, user_login)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_pr_state (
-            org TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            pr_number INTEGER NOT NULL,
-            author_login TEXT NOT NULL,
-            state TEXT NOT NULL,
-            merged INTEGER NOT NULL DEFAULT 0,
-            closed_at INTEGER,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, repo, pr_number)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_review_credits (
-            org TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            pr_number INTEGER NOT NULL,
-            month_key TEXT NOT NULL,
-            reviewer_login TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (org, repo, pr_number, month_key, reviewer_login)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_backfill_state (
-            org TEXT NOT NULL,
-            month_key TEXT NOT NULL,
-            next_page INTEGER NOT NULL DEFAULT 1,
-            completed INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, month_key)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_backfill_repo_done (
-            org TEXT NOT NULL,
-            month_key TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY (org, month_key, repo)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS mentor_assignments (
-            org TEXT NOT NULL,
-            mentor_login TEXT NOT NULL,
-            issue_repo TEXT NOT NULL,
-            issue_number INTEGER NOT NULL,
-            assigned_at INTEGER NOT NULL,
-            mentee_login TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (org, issue_repo, issue_number)
-        )
-        """,
-    )
-    # Migration: add mentee_login only when missing to avoid duplicate-column errors.
-    if not await _d1_has_column(db, "mentor_assignments", "mentee_login"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentor_assignments ADD COLUMN mentee_login TEXT NOT NULL DEFAULT ''",
-        )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS mentors (
-            github_username TEXT NOT NULL PRIMARY KEY,
-            name TEXT NOT NULL,
-            specialties TEXT NOT NULL DEFAULT '[]',
-            max_mentees INTEGER NOT NULL DEFAULT 3,
-            active INTEGER NOT NULL DEFAULT 1,
-            timezone TEXT NOT NULL DEFAULT '',
-            referred_by TEXT NOT NULL DEFAULT '',
-            email TEXT NOT NULL DEFAULT '',
-            slack_username TEXT NOT NULL DEFAULT ''
-        )
-        """,
-    )
-    if not await _d1_has_column(db, "mentors", "email"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentors ADD COLUMN email TEXT NOT NULL DEFAULT ''",
-        )
-    if not await _d1_has_column(db, "mentors", "slack_username"):
-        await _d1_run(
-            db,
-            "ALTER TABLE mentors ADD COLUMN slack_username TEXT NOT NULL DEFAULT ''",
-        )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS mentor_stats_cache (
-            org TEXT NOT NULL,
-            github_username TEXT NOT NULL,
-            merged_prs INTEGER NOT NULL DEFAULT 0,
-            reviews INTEGER NOT NULL DEFAULT 0,
-            fetched_at INTEGER NOT NULL,
-            PRIMARY KEY (org, github_username)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS contributor_referrals (
-            org TEXT NOT NULL,
-            month_key TEXT NOT NULL,
-            referrer_login TEXT NOT NULL,
-            referred_login TEXT NOT NULL,
-            repo TEXT NOT NULL,
-            issue_number INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (org, month_key, referrer_login, referred_login)
-        )
-        """,
-    )
-    await _d1_run(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_processed_comments (
-            comment_id INTEGER NOT NULL PRIMARY KEY,
-            processed_at INTEGER NOT NULL
-        )
-        """,
-    )
+    """Compatibility shim for legacy call-sites.
+
+    Schema is managed via Wrangler D1 migrations under `migrations/`.
+    This helper now only ensures mentor seed data exists.
+    """
     await _populate_mentors_table(db)
 
 
@@ -744,12 +570,14 @@ async def _populate_mentors_table(db) -> None:
                 db,
                 """
                 INSERT OR IGNORE INTO mentors
-                    (github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (github_username, name, title, bio, specialties, max_mentees, active, timezone, referred_by, email, slack_username)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     m["github_username"],
                     m["name"],
+                    m.get("title", "") or "",
+                    m.get("bio", "") or "",
                     json.dumps(m.get("specialties") or []),
                     m.get("max_mentees", 3),
                     1 if m.get("active", True) else 0,
@@ -773,7 +601,7 @@ async def _load_mentors_from_d1(db) -> list:
         await _ensure_leaderboard_schema(db)
         rows = await _d1_all(
             db,
-            "SELECT github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username FROM mentors",
+            "SELECT github_username, name, title, bio, specialties, max_mentees, active, timezone, referred_by, email, slack_username, total_prs FROM mentors",
         )
         mentors = []
         for row in rows:
@@ -784,6 +612,8 @@ async def _load_mentors_from_d1(db) -> list:
             mentors.append({
                 "github_username": row["github_username"],
                 "name": row["name"],
+                "title": row.get("title") or "",
+                "bio": row.get("bio") or "",
                 "specialties": specialties,
                 "max_mentees": int(row.get("max_mentees") or 3),
                 "active": bool(row.get("active", 1)),
@@ -791,6 +621,7 @@ async def _load_mentors_from_d1(db) -> list:
                 "referred_by": row.get("referred_by") or "",
                 "email": row.get("email") or "",
                 "slack_username": row.get("slack_username") or "",
+                "total_prs": int(row.get("total_prs") or 0),
             })
         console.log(f"[MentorPool] Loaded {len(mentors)} mentors from D1")
         return mentors
@@ -803,7 +634,9 @@ async def _d1_add_mentor(
     db,
     github_username: str,
     name: str,
-    specialties: list,
+    specialties: Optional[list] = None,
+    title: str = "",
+    bio: str = "",
     max_mentees: int = 3,
     active: bool = True,
     timezone: str = "",
@@ -816,10 +649,12 @@ async def _d1_add_mentor(
         db,
         """
         INSERT INTO mentors
-            (github_username, name, specialties, max_mentees, active, timezone, referred_by, email, slack_username)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (github_username, name, title, bio, specialties, max_mentees, active, timezone, referred_by, email, slack_username)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(github_username) DO UPDATE SET
             name        = excluded.name,
+            title       = excluded.title,
+            bio         = excluded.bio,
             specialties = excluded.specialties,
             max_mentees = excluded.max_mentees,
             active      = excluded.active,
@@ -831,7 +666,9 @@ async def _d1_add_mentor(
         (
             github_username,
             name,
-            json.dumps(specialties),
+            title or "",
+            bio or "",
+            json.dumps(specialties or []),
             max_mentees,
             1 if active else 0,
             timezone or "",
@@ -1985,14 +1822,17 @@ async def _backfill_repo_month_if_needed(
     # Also include webhook-tracked merged PRs whose review webhooks may have been missed
     # (e.g. during app downtime). The leaderboard_review_credits idempotency guard ensures
     # no duplicate credits are awarded even if a PR is processed again.
+    # Only include PRs merged within the current month window to avoid crediting reviews
+    # from previous months to the current month's leaderboard.
     if len(merged_prs_for_review) < MAX_REVIEW_BACKFILL:
         tracked_merged_rows = await _d1_all(
             db,
             """
             SELECT pr_number, author_login FROM leaderboard_pr_state
             WHERE org = ? AND repo = ? AND merged = 1
+              AND closed_at >= ? AND closed_at <= ?
             """,
-            (owner, repo_name),
+            (owner, repo_name, start_ts, end_ts),
         )
         newly_added = {pr_num for pr_num, _ in merged_prs_for_review}
         for row in (tracked_merged_rows or []):
@@ -3370,6 +3210,22 @@ async def _assign_mentor_to_issue(
         {"labels": [MENTOR_ASSIGNED_LABEL]},
     )
 
+    # Step 5: Add the mentor as a GitHub assignee (best-effort).
+    assignee_resp = await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/issues/{issue_number}/assignees",
+        token,
+        {"assignees": [mentor_username]},
+    )
+    assignee_status = getattr(assignee_resp, "status", None)
+    if assignee_status not in (200, 201):
+        console.error(
+            f"[MentorPool] Failed to add @{mentor_username} as GitHub assignee "
+            f"for {owner}/{repo}#{issue_number} (status={assignee_status}). "
+            "Mentor lacks repo collaborator access or the token is insufficient. "
+            "Label and comment were still applied."
+        )
+
     specialties_info = ""
     if mentor.get("specialties"):
         specialties_info = f" (specialties: {', '.join(mentor['specialties'])})"
@@ -3444,8 +3300,9 @@ async def handle_mentor_unassign(
     - Deleting the D1 assignment record.
     - Posting a confirmation comment.
 
-    The issue author, the currently assigned mentor, or any repo maintainer
-    (admin or maintain permission) may use this command.
+    The issue author, the current issue assignee, the currently assigned
+    mentor, or any repo maintainer (admin or maintain permission) may use
+    this command.
     """
     issue_number = issue["number"]
     current_labels = {lb.get("name", "").lower() for lb in issue.get("labels", [])}
@@ -3465,22 +3322,26 @@ async def handle_mentor_unassign(
         owner, repo, issue_number, token
     )
 
-    # Permission check: allow the issue author, the assigned mentor, or any
-    # repo maintainer (admin/maintain) to unmentor.  The maintainer check calls
-    # the GitHub API so we skip it when one of the cheaper conditions already
-    # grants access.
+    # Permission check: allow the issue author, any current issue assignee,
+    # the assigned mentor, or any repo maintainer (admin/maintain) to unmentor.
+    # The maintainer check calls the GitHub API so we skip it when one of the
+    # cheaper conditions already grants access.
     issue_author = (issue.get("user") or {}).get("login", "")
     is_issue_author = login.lower() == issue_author.lower()
     is_assigned_mentor = current_mentor and login.lower() == current_mentor.lower()
-    if not is_issue_author and not is_assigned_mentor:
+    issue_assignee_logins = {
+        (a.get("login") or "").lower() for a in (issue.get("assignees") or [])
+    }
+    is_current_assignee = login.lower() in issue_assignee_logins
+    if not is_issue_author and not is_assigned_mentor and not is_current_assignee:
         is_repo_maintainer = await _is_maintainer(owner, repo, login, token)
         if not is_repo_maintainer:
             await create_comment(
                 owner,
                 repo,
                 issue_number,
-                f"@{login} Only the issue author, the assigned mentor, or a repo maintainer "
-                "can remove a mentor assignment. "
+                f"@{login} Only the issue author, a current assignee, the assigned mentor, "
+                "or a repo maintainer can remove a mentor assignment. "
                 "Use `/rematch` if you'd like a different mentor.\n\n"
                 "— [OWASP BLT-Pool](https://pool.owaspblt.org)",
                 token,
@@ -4534,10 +4395,12 @@ async def _post_merged_pr_combined_comment(
     # ---------------------------------------------------------------------------
     # 2. Build the combined comment body
     # ---------------------------------------------------------------------------
+    repo_full_name = f"{owner}/{repo}"
+    repo_url = f"https://github.com/{owner}/{repo}"
     thanks_section = (
         f"🎉 PR merged! Thanks for your contribution, @{author_login}!\n\n"
         "Your work is now part of the project. Keep contributing to "
-        "[OWASP BLT-Pool](https://pool.owaspblt.org) and help make the web a safer place! 🛡️\n\n"
+        f"[{repo_full_name}]({repo_url}) and help make the web a safer place! 🛡️\n\n"
         "Visit [pool.owaspblt.org](https://pool.owaspblt.org) to explore the mentor pool and connect with contributors."
     )
 
@@ -4807,9 +4670,11 @@ async def check_unresolved_conversations(payload, token):
         page += 1
 
     if unresolved:
+        pr_author_login = (pr.get("user") or {}).get("login", "")
+        username_block = f"@{pr_author_login}\n\n" if pr_author_login else ""
         comment_body = (
             f"{marker}\n"
-            f"⚠️ This pull request has **{unresolved_count} unresolved review "
+            f"{username_block}⚠️ This pull request has **{unresolved_count} unresolved review "
             f"{noun}** that must be resolved before merging."
         )
         if existing_comment_id is not None:
@@ -5497,6 +5362,8 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
                 When provided, totals are shown on the card.
     """
     name = _html_mod.escape(mentor.get("name", "Unknown"))
+    title = _html_mod.escape((mentor.get("title") or "").strip())
+    bio = _html_mod.escape((mentor.get("bio") or "").strip())
     github = mentor.get("github_username", "")
     specialties = mentor.get("specialties", [])
     max_mentees = mentor.get("max_mentees", 3)
@@ -5511,7 +5378,6 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         else "https://api.dicebear.com/7.x/initials/svg?seed=" + quote(name)
     )
 
-    # Status dot color: green = available, blue = mentoring, gray = inactive.
     if not active or status == "inactive":
         dot_color = "bg-gray-300"
         dot_title = "Inactive"
@@ -5522,7 +5388,6 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         dot_color = "bg-emerald-400"
         dot_title = "Available"
 
-    # Avatar wrapped in a GitHub profile link; status dot overlaid bottom-right.
     if github:
         avatar_block = (
             f'<div class="relative shrink-0" title="{dot_title}">'
@@ -5543,11 +5408,10 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         )
 
     specialty_chips = " ".join(
-        f'<span class="rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-600">{s}</span>'
+        f'<span class="rounded bg-gray-100 px-1.5 py-0.5 text-xs text-gray-600">{_html_mod.escape(str(s))}</span>'
         for s in specialties
     ) if specialties else ""
 
-    # Visible status chip — used instead of a tooltip so mobile users can read status.
     if not active or status == "inactive":
         status_chip = (
             '<span class="inline-flex items-center gap-1 text-xs text-gray-400 whitespace-nowrap">'
@@ -5564,7 +5428,6 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
             '<span class="h-2 w-2 rounded-full bg-emerald-400 shrink-0"></span>Available</span>'
         )
 
-    # Compact meta items — each is its own flex child so they can wrap independently on mobile.
     sep = '<span class="text-gray-300 select-none text-xs" aria-hidden="true">·</span>'
     meta_parts = [status_chip]
     if timezone:
@@ -5593,20 +5456,27 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         + '</div>'
     )
 
+    title_row = f'<p class="mt-1 text-sm font-semibold text-[#E10101]">{title}</p>' if title else ''
+    bio_row = f'<p class="mt-3 text-sm leading-relaxed text-gray-600">{bio}</p>' if bio else ''
     skills_row = (
-        '<div class="mt-1.5 flex flex-wrap gap-1">' + specialty_chips + '</div>'
-        if specialty_chips else ''
+        '<div class="mt-3 flex flex-wrap gap-1">' + specialty_chips + '</div>'
+        if specialty_chips
+        else '<div class="mt-3 text-xs text-gray-400">—</div>'
     )
 
-    # Compact stats row — shown only when D1 data is available.
-    if stats:
-        merged_prs = int(stats.get("merged_prs") or 0)
-        reviews = int(stats.get("reviews") or 0)
+    has_stats = stats is not None
+    has_total_prs = "total_prs" in mentor and mentor.get("total_prs") is not None
+    if has_stats or has_total_prs:
+        if has_stats and stats.get("merged_prs") is not None:
+            total_prs = int(stats["merged_prs"])
+        else:
+            total_prs = int(mentor.get("total_prs") or 0)
+        reviews = int((stats or {}).get("reviews") or 0)
         stats_row = (
-            f'<div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5">'
+            f'<div class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-0.5">'
             f'<span class="text-xs text-gray-400 whitespace-nowrap">'
             f'<i class="fa-solid fa-code-pull-request mr-0.5 text-gray-300" aria-hidden="true"></i>'
-            f'<span class="font-semibold text-gray-600">{merged_prs}</span> PRs</span>'
+            f'<span class="font-semibold text-gray-600">{total_prs}</span> PRs</span>'
             f'<span class="text-xs text-gray-400 whitespace-nowrap">'
             f'<i class="fa-solid fa-magnifying-glass-chart mr-0.5 text-gray-300" aria-hidden="true"></i>'
             f'<span class="font-semibold text-gray-600">{reviews}</span> reviews</span>'
@@ -5616,18 +5486,18 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None) -> str:
         stats_row = ""
 
     return f'''
-    <li class="flex items-start gap-3 rounded-xl border border-[#E5E5E5] bg-white px-4 py-3 transition hover:shadow-sm">
-      {avatar_block}
-      <div class="min-w-0 flex-1">
-        <!-- Row 1: name -->
-        <p class="font-semibold text-[#111827] text-sm leading-snug">{name}</p>
-        <!-- Row 2: status + meta — each item wraps independently on narrow screens -->
-        {meta_row}
-        <!-- Row 3: skills — full width -->
-        {skills_row}
-        <!-- Row 4: compact stats -->
-        {stats_row}
+    <li class="rounded-2xl border border-[#E5E5E5] bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md">
+      <div class="flex items-start gap-3">
+        {avatar_block}
+        <div class="min-w-0 flex-1">
+          <p class="font-semibold text-[#111827] text-base leading-snug">{name}</p>
+          {title_row}
+          {meta_row}
+        </div>
       </div>
+      {bio_row}
+      {skills_row}
+      {stats_row}
     </li>
     '''
 
@@ -5779,10 +5649,6 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
           <ol class="space-y-0">
             {lb_items}
           </ol>
-          <div class="mt-4 rounded-lg bg-gray-50 border border-[#E5E5E5] px-3 py-2">
-            <p class="text-xs font-semibold text-gray-600 mb-1"><i class="fa-solid fa-circle-info mr-1 text-[#E10101]" aria-hidden="true"></i>How to refer a friend</p>
-            <p class="text-xs text-gray-500">Mention them in any issue or PR comment, e.g. <code class="rounded bg-gray-200 px-1 py-0.5 text-xs font-mono text-gray-700">Hey @username, check this out!</code> — if they have no prior activity, it counts as a referral.</p>
-          </div>
         </section>'''
     else:
         leaderboard_html = '''
@@ -5794,10 +5660,6 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             <h3 class="text-lg font-bold text-[#111827]">Referral Leaderboard</h3>
           </div>
           <p class="mb-4 text-sm text-gray-500">No referrals yet — be the first to invite a friend!</p>
-          <div class="rounded-lg bg-gray-50 border border-[#E5E5E5] px-3 py-2">
-            <p class="text-xs font-semibold text-gray-600 mb-1"><i class="fa-solid fa-circle-info mr-1 text-[#E10101]" aria-hidden="true"></i>How to refer a friend</p>
-            <p class="text-xs text-gray-500">Mention them in any issue or PR comment, e.g. <code class="rounded bg-gray-200 px-1 py-0.5 text-xs font-mono text-gray-700">Hey @username, check this out!</code> — if they have no prior activity, it counts as a referral.</p>
-          </div>
         </section>'''
 
     return f'''<!DOCTYPE html>
@@ -5922,7 +5784,7 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             Mentor Pool <span class="text-base font-medium text-gray-500">({mentor_count} total, {available_count} available)</span>
           </h3>
         </div>
-        <ul class="space-y-2" aria-label="Mentor list">
+                <ul class="grid grid-cols-1 gap-4 sm:grid-cols-2" aria-label="Mentor list">
           {mentor_rows_html}
         </ul>
       </section>
@@ -6019,6 +5881,22 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
                  maxlength="39" pattern="[a-zA-Z0-9]([a-zA-Z0-9\\-]{{0,37}}[a-zA-Z0-9])?"
                  class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
         </div>
+                <div>
+                    <label for="mf-title" class="mb-1 block text-sm font-semibold text-gray-700">
+                        Title <span class="text-xs font-normal text-gray-400">(optional)</span>
+                    </label>
+                    <input id="mf-title" type="text" placeholder="e.g. Senior Security Engineer"
+                                 maxlength="120"
+                                 class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none">
+                </div>
+                <div>
+                    <label for="mf-bio" class="mb-1 block text-sm font-semibold text-gray-700">
+                        Bio <span class="text-xs font-normal text-gray-400">(optional)</span>
+                    </label>
+                    <textarea id="mf-bio" rows="3" placeholder="What do you mentor people on?"
+                                        maxlength="500"
+                                        class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-[#E10101] focus:ring-1 focus:ring-[#E10101] focus:outline-none"></textarea>
+                </div>
         <div class="sm:col-span-2">
           <label for="mf-specialties" class="mb-1 block text-sm font-semibold text-gray-700">
             Specialties <span class="text-xs font-normal text-gray-400">(optional — comma-separated)</span>
@@ -6100,6 +5978,8 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
             e.preventDefault();
             var name     = document.getElementById('mf-name').value.trim();
             var github   = document.getElementById('mf-github').value.trim().replace(/^@/, '');
+                        var title    = document.getElementById('mf-title').value.trim();
+                        var bio      = document.getElementById('mf-bio').value.trim();
             var specs    = document.getElementById('mf-specialties').value.trim();
             var maxM     = parseInt(document.getElementById('mf-max').value.trim(), 10);
             var tz       = document.getElementById('mf-tz').value.trim();
@@ -6130,6 +6010,16 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
               errEl.classList.remove('hidden');
               return;
             }}
+                        if (title.length > 120) {{
+                            errEl.textContent = 'Title must be 120 characters or fewer.';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
+                        if (bio.length > 500) {{
+                            errEl.textContent = 'Bio must be 500 characters or fewer.';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
             if (tz.length > 60) {{
               errEl.textContent = 'Timezone must be 60 characters or fewer.';
               errEl.classList.remove('hidden');
@@ -6147,6 +6037,16 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
               errEl.classList.remove('hidden');
               return;
             }}
+                        if (containsScripting(title)) {{
+                            errEl.textContent = 'Title contains invalid characters. HTML and scripting are not allowed.';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
+                        if (containsScripting(bio)) {{
+                            errEl.textContent = 'Bio contains invalid characters. HTML and scripting are not allowed.';
+                            errEl.classList.remove('hidden');
+                            return;
+                        }}
             if (containsScripting(tz)) {{
               errEl.textContent = 'Timezone contains invalid characters. HTML and scripting are not allowed.';
               errEl.classList.remove('hidden');
@@ -6214,6 +6114,8 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
               body: JSON.stringify({{
                 name: name,
                 github_username: github,
+                                title: title,
+                                bio: bio,
                 specialties: specialties,
                 max_mentees: maxM,
                 timezone: tz,
@@ -6278,8 +6180,12 @@ _SPECIALTY_RE = re.compile(r"^[a-z0-9][a-z0-9+#.\-]{0,29}$")
 # Display name: 1-100 printable characters, no HTML angle brackets, ampersands,
 # double quotes, or ASCII control characters (prevents script injection).
 _NAME_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,100}$")
+# Mentor title: optional short free-form role label.
+_TITLE_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,120}$")
 # Timezone: optional free-form label, same restrictions as name but max 60 chars.
 _TIMEZONE_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,60}$")
+# Mentor bio: optional paragraph-length plain text.
+_BIO_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,500}$")
 # Email format and bounds for mentor contact details.
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,190}\.[A-Za-z]{2,}$")
 # Slack username without @, lower/upper letters, digits, dot, underscore, hyphen.
@@ -6313,6 +6219,8 @@ async def _handle_add_mentor(request, env) -> "Response":
         {
             "name": "Jane Doe",
             "github_username": "janedoe",
+            "title": "Senior Security Engineer",    // optional
+            "bio": "I mentor first-time contributors in appsec and triage.",  // optional
             "specialties": ["frontend", "python"],   // optional
             "max_mentees": 3,                         // optional, 1-10
             "timezone": "UTC+5:30",                   // optional
@@ -6330,6 +6238,8 @@ async def _handle_add_mentor(request, env) -> "Response":
 
     name = (body.get("name") or "").strip()
     github_username = (body.get("github_username") or "").strip().lstrip("@")
+    title = (body.get("title") or "").strip()
+    bio = (body.get("bio") or "").strip()
     specialties_raw = body.get("specialties") or []
     max_mentees = body.get("max_mentees", 3)
     timezone = (body.get("timezone") or "").strip()
@@ -6341,6 +6251,10 @@ async def _handle_add_mentor(request, env) -> "Response":
         return _json({"error": "Field 'name' is required"}, 400)
     if not _NAME_RE.match(name):
         return _json({"error": "Display name contains invalid characters (HTML and scripting are not allowed)"}, 400)
+    if title and not _TITLE_RE.match(title):
+        return _json({"error": "Title contains invalid characters (HTML and scripting are not allowed)"}, 400)
+    if bio and not _BIO_RE.match(bio):
+        return _json({"error": "Bio contains invalid characters (HTML and scripting are not allowed)"}, 400)
     if not github_username:
         return _json({"error": "Field 'github_username' is required"}, 400)
     if not _GH_USERNAME_RE.match(github_username):
@@ -6409,6 +6323,8 @@ async def _handle_add_mentor(request, env) -> "Response":
             db,
             github_username=github_username,
             name=name,
+            title=title,
+            bio=bio,
             specialties=specialties,
             max_mentees=max_mentees,
             active=mentor_is_active,
@@ -6435,14 +6351,17 @@ async def _handle_add_mentor(request, env) -> "Response":
 # ---------------------------------------------------------------------------
 
 
-def _json(data, status: int = 200) -> Response:
+def _json(data, status: int = 200, allow_cors: bool = False) -> Response:
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if allow_cors:
+        headers["Access-Control-Allow-Origin"] = "*"
+    
     return Response.new(
         json.dumps(data),
         status=status,
-        headers=Headers.new({
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-        }.items()),
+        headers=Headers.new(headers.items()),
     )
 
 
@@ -6471,13 +6390,33 @@ async def on_fetch(request, env, ctx=None) -> Response:
         return admin_response
 
     if method == "GET" and path == "/":
-        # Load mentors from D1.
-        org = getattr(env, "GITHUB_ORG", "OWASP-BLT")
+        # Fast-path homepage mode (default): render immediately from local mentor
+        # data and skip expensive GitHub-backed stats/assignment lookups.
+        homepage_fast_mode = str(getattr(env, "HOMEPAGE_FAST_MODE", "1") or "1").strip().lower() not in {
+            "0", "false", "no", "off"
+        }
+
         mentors: list = []
         try:
             mentors = await _load_mentors_local(env)
         except Exception as exc:
             console.error(f"[MentorPool] Failed to load mentors for homepage: {exc}")
+
+        if homepage_fast_mode:
+            html = _index_html(mentors, {}, [], {}, _admin_path(env))
+            return Response.new(
+                html,
+                status=200,
+                headers=Headers.new(
+                    {
+                        "Content-Type": "text/html; charset=utf-8",
+                        "Cache-Control": "public, max-age=60, s-maxage=300, stale-while-revalidate=86400",
+                    }.items()
+                ),
+            )
+
+        # Full mode (opt-in via HOMEPAGE_FAST_MODE=0): includes stats and assignments.
+        org = getattr(env, "GITHUB_ORG", "OWASP-BLT")
         # Fetch per-mentor activity stats from D1 (best-effort; no stats if D1 unavailable).
         mentor_stats: dict = {}
         try:
@@ -6521,7 +6460,8 @@ async def on_fetch(request, env, ctx=None) -> Response:
                 "checks": {
                     "webhook_security": webhook_security,
                 },
-            }
+            },
+            allow_cors=True,
         )
 
     if method == "POST" and path == "/api/mentors":
